@@ -322,6 +322,9 @@ if TYPE_CHECKING:
     from .wav2vec2_bert import *
     from .wav2vec2_conformer import *
     from .wav2vec2_phoneme import *
+    #### time wav2vec ####
+    from .wav2vec2_time import *
+    #### time wav2vec ####
     from .wav2vec2_with_lm import *
     from .wavlm import *
     from .whisper import *
