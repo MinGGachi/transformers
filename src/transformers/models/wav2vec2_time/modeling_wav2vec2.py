@@ -17,7 +17,7 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, Dict, Any
 
 import numpy as np
 import torch
@@ -56,8 +56,9 @@ from ...utils import (
 )
 from .configuration_wav2vec2 import Wav2Vec2Config
 
+from torchdiffeq import odeint_adjoint as odeint
 # Time Varying torch.nn.Module
-from model.sinusoidal import SinusoidalPositionalEmbedding
+from model.sinusoidal import SinusoidalEmbedding
 from model.time_nn import Linear, Conv1d, LayerNorm
 
 WAV2VEC2_ADAPTER_PT_FILE = "adapter.{}.bin"
@@ -685,6 +686,13 @@ class Wav2Vec2EncoderLayer(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
         super().__init__()
+        # for time-varying modules
+        self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
+        if isinstance(config.time_activation, str):
+            self.time_activation = ACT2FN[config.time_activation]
+        else:
+            self.time_activation = config.time_activation
+
         self.attention = Wav2Vec2Attention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -692,12 +700,6 @@ class Wav2Vec2EncoderLayer(nn.Module):
             is_decoder=False,
             config=config,
         )
-
-        if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
-        else:
-            self.time_activation = config.time_activation
-
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                     rank=config.rank, time_dim=config.time_dim,
@@ -708,11 +710,20 @@ class Wav2Vec2EncoderLayer(nn.Module):
                                           hidden_dim=config.hidden_dim, activation=self.time_activation)
 
     def forward(self, 
-                hidden_states: torch.Tensor,
-                sinusoidal_emb: torch.Tensor,
-                attention_mask: Optional[torch.Tensor] = None,
-                output_attentions: bool = False,
+                time: torch.Tensor,
+                input_dict: Dict[str, Any],
                 ):
+        # input_dict: {"hidden_states", "attention_mask", "output_attentions"}
+        # for torchdiffeq, solver only can pass (time, y) as input
+        # so pack the hidden_states, attention_mask, output_attentions into input_dict
+            # hidden_states: torch.Tensor,
+            # attention_mask: Optional[torch.Tensor] = None,
+            # output_attentions: bool = False,
+        hidden_states = input_dict["hidden_states"]
+        attention_mask = input_dict["attention_mask"]
+        output_attentions = input_dict["output_attentions"]
+
+        sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
         hidden_states, attn_weights, _ = self.attention(
             hidden_states, sinusoidal_emb, attention_mask=attention_mask, output_attentions=output_attentions
@@ -736,6 +747,13 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
         super().__init__()
+        # for time-varying modules
+        self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
+        if isinstance(config.time_activation, str):
+            self.time_activation = ACT2FN[config.time_activation]
+        else:
+            self.time_activation = config.time_activation
+
         self.attention = Wav2Vec2Attention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -743,12 +761,6 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
             is_decoder=False,
             config=config,
         )
-
-        if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
-        else:
-            self.time_activation = config.time_activation
-
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                     rank=config.rank, time_dim=config.time_dim,
@@ -765,11 +777,20 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        sinusoidal_emb: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-    ):
+        time: torch.Tensor,
+        input_dict: Dict[str, Any],
+        ):
+        # input_dict: {"hidden_states", "attention_mask", "output_attentions"}
+        # for torchdiffeq, solver only can pass (time, y) as input
+        # so pack the hidden_states, attention_mask, output_attentions into input_dict
+            # hidden_states: torch.Tensor,
+            # attention_mask: Optional[torch.Tensor] = None,
+            # output_attentions: bool = False,
+        hidden_states = input_dict["hidden_states"]
+        attention_mask = input_dict["attention_mask"]
+        output_attentions = input_dict["output_attentions"]
+
+        sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
         hidden_states = self.layer_norm(hidden_states, sinusoidal_emb)
         hidden_states, attn_weights, _ = self.attention(
@@ -795,7 +816,6 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
 class Wav2Vec2Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
-        from torchdiffeq import odeint_adjoint as odeint
 
         self.config = config
         self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
@@ -808,6 +828,7 @@ class Wav2Vec2Encoder(nn.Module):
     def forward(
         self,
         hidden_states: torch.tensor,
+        time: Union[torch.Tensor, int],
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -833,37 +854,13 @@ class Wav2Vec2Encoder(nn.Module):
 
         synced_gpus = is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)
 
-        for layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+        # using torchdiffeq, modeling the sequence of neural ODEs.
+        if isinstance(time, torch.Tensor):
+            hidden_states = odeint(self.layer, hidden_states, time, method="euler")
+        else:
+            time = nn.Parameter(torch.tensor(time))
+            hidden_states = odeint(self.layer, hidden_states, time, method="euler")
 
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = torch.rand([])
-
-            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
-            if not skip_the_layer or synced_gpus:
-                # under fsdp or deepspeed zero3 all gpus must run in sync
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        layer.__call__,
-                        hidden_states,
-                        attention_mask,
-                        output_attentions,
-                    )
-                else:
-                    layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-                    )
-                hidden_states = layer_outputs[0]
-
-            if skip_the_layer:
-                layer_outputs = (None, None)
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
