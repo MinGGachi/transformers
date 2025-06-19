@@ -58,8 +58,7 @@ from .configuration_wav2vec2 import Wav2Vec2Config
 
 from torchdiffeq import odeint_adjoint as odeint
 # Time Varying torch.nn.Module
-from model.sinusoidal import SinusoidalEmbedding
-from model.time_nn import Linear, Conv1d, LayerNorm
+from speech_norm.src.model import SinusoidalEmbedding, Linear, LayerNorm
 
 WAV2VEC2_ADAPTER_PT_FILE = "adapter.{}.bin"
 WAV2VEC2_ADAPTER_SAFE_FILE = "adapter.{}.safetensors"
