@@ -535,7 +535,7 @@ class Wav2Vec2Attention(nn.Module):
         self.is_decoder = is_decoder
         self.is_causal = is_causal
 
-        # activation function for the time-varying modules
+        # activation function for the weight generator
         if isinstance(config.time_activation, str):
             self.time_activation = ACT2FN[config.time_activation]
         else:
@@ -551,8 +551,8 @@ class Wav2Vec2Attention(nn.Module):
                              rank=config.rank, time_dim=config.time_dim,
                              hidden_dim=config.hidden_dim, activation=self.time_activation)
         self.out_proj = Linear(embed_dim, embed_dim, bias=bias,
-                             rank=config.rank, time_dim=config.time_dim,
-                             hidden_dim=config.hidden_dim, activation=self.time_activation)
+                               rank=config.rank, time_dim=config.time_dim,
+                               hidden_dim=config.hidden_dim, activation=self.time_activation)
 
     def forward(
         self,
@@ -710,27 +710,20 @@ class Wav2Vec2EncoderLayer(nn.Module):
 
     def forward(self, 
                 time: torch.Tensor,
-                input_dict: Dict[str, Any],
+                hidden_states: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None, 
+                output_attentions: bool = False
                 ):
-        # input_dict: {"hidden_states", "attention_mask", "output_attentions"}
-        # for torchdiffeq, solver only can pass (time, y) as input
-        # so pack the hidden_states, attention_mask, output_attentions into input_dict
-            # hidden_states: torch.Tensor,
-            # attention_mask: Optional[torch.Tensor] = None,
-            # output_attentions: bool = False,
-        hidden_states = input_dict["hidden_states"]
-        attention_mask = input_dict["attention_mask"]
-        output_attentions = input_dict["output_attentions"]
-
         sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
+
         hidden_states, attn_weights, _ = self.attention(
             hidden_states, sinusoidal_emb, attention_mask=attention_mask, output_attentions=output_attentions
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
-
         hidden_states = self.layer_norm(hidden_states, sinusoidal_emb)
+
         hidden_states = hidden_states + self.feed_forward(hidden_states, sinusoidal_emb)
         hidden_states = self.final_layer_norm(hidden_states, sinusoidal_emb)
 
@@ -774,29 +767,22 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         else:
             self.adapter_layer = None
 
-    def forward(
-        self,
-        time: torch.Tensor,
-        input_dict: Dict[str, Any],
-        ):
-        # input_dict: {"hidden_states", "attention_mask", "output_attentions"}
-        # for torchdiffeq, solver only can pass (time, y) as input
-        # so pack the hidden_states, attention_mask, output_attentions into input_dict
-            # hidden_states: torch.Tensor,
-            # attention_mask: Optional[torch.Tensor] = None,
-            # output_attentions: bool = False,
-        hidden_states = input_dict["hidden_states"]
-        attention_mask = input_dict["attention_mask"]
-        output_attentions = input_dict["output_attentions"]
-
+    def forward(self, 
+                time: torch.Tensor,
+                hidden_states: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None, 
+                output_attentions: bool = False
+                ):
         sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
+
         hidden_states = self.layer_norm(hidden_states, sinusoidal_emb)
         hidden_states, attn_weights, _ = self.attention(
             hidden_states, sinusoidal_emb, attention_mask=attention_mask, output_attentions=output_attentions
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
+
         hidden_states = self.final_layer_norm(hidden_states, sinusoidal_emb)
         hidden_states = hidden_states + self.feed_forward(hidden_states, sinusoidal_emb)
 
@@ -827,13 +813,14 @@ class Wav2Vec2Encoder(nn.Module):
     def forward(
         self,
         hidden_states: torch.tensor,
-        time: Union[torch.Tensor, int],
+        time: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
         all_hidden_states = () if output_hidden_states else None
+        # TODO: how to get the attention weights?
         all_self_attentions = () if output_attentions else None
 
         if attention_mask is not None:
@@ -851,15 +838,17 @@ class Wav2Vec2Encoder(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
-        synced_gpus = is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
-        if isinstance(time, torch.Tensor):
-            hidden_states = odeint(self.layer, hidden_states, time, method="euler")
-        else:
-            time = nn.Parameter(torch.tensor(time))
-            hidden_states = odeint(self.layer, hidden_states, time, method="euler")
+        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask, output_attentions=False)
+        trajectory = odeint(closure_layer, hidden_states, time, method=self.config.solver_type)
+        
+        hidden_states = trajectory[-1]
 
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + tuple(trajectory)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
@@ -900,20 +889,23 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(
-            [Wav2Vec2EncoderLayerStableLayerNorm(config) for _ in range(config.num_hidden_layers)]
-        )
+        # self.layers = nn.ModuleList(
+        #     [Wav2Vec2EncoderLayerStableLayerNorm(config) for _ in range(config.num_hidden_layers)]
+        # )
+        self.layer = Wav2Vec2EncoderLayerStableLayerNorm(config)
         self.gradient_checkpointing = False
 
     def forward(
         self,
         hidden_states,
+        time,
         attention_mask=None,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
     ):
         all_hidden_states = () if output_hidden_states else None
+        # TODO: how to get the attention weights?
         all_self_attentions = () if output_attentions else None
 
         if attention_mask is not None:
@@ -930,42 +922,18 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         hidden_states = hidden_states + position_embeddings
         hidden_states = self.dropout(hidden_states)
 
-        synced_gpus = is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
-        for layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = torch.rand([])
-
-            skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
-            if not skip_the_layer or synced_gpus:
-                # under fsdp or deepspeed zero3 all gpus must run in sync
-                # XXX: could optimize this like synced_gpus in generate_utils but not sure if it's worth the code complication
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        layer.__call__,
-                        hidden_states,
-                        attention_mask,
-                        output_attentions,
-                    )
-                else:
-                    layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-                    )
-                hidden_states = layer_outputs[0]
-
-            if skip_the_layer:
-                layer_outputs = (None, None)
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
+        # using torchdiffeq, modeling the sequence of neural ODEs.
+        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask, output_attentions=False)
+        trajectory = odeint(closure_layer, hidden_states, time, method=self.config.solver_type)
+        
+        hidden_states = trajectory[-1]
         hidden_states = self.layer_norm(hidden_states)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_hidden_states = all_hidden_states + tuple(trajectory)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
