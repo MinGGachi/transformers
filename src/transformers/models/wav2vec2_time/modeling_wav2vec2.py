@@ -797,7 +797,6 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         return outputs
     
 
-# TODO: using torchdiffeq, modeling the sequence of neural ODEs.
 class Wav2Vec2Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1524,6 +1523,7 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
@@ -1557,6 +1557,7 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
 
         encoder_outputs = self.encoder(
             hidden_states,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1648,6 +1649,7 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.BoolTensor] = None,
         sampled_negative_indices: Optional[torch.BoolTensor] = None,
@@ -1717,6 +1719,7 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1824,6 +1827,7 @@ class Wav2Vec2ForMaskedLM(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: torch.FloatTensor,
+        time: torch.Tensor,
         attention_mask: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1834,6 +1838,7 @@ class Wav2Vec2ForMaskedLM(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1937,6 +1942,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1957,6 +1963,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -2060,6 +2067,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -2083,6 +2091,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -2174,6 +2183,7 @@ class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
@@ -2197,6 +2207,7 @@ class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -2356,6 +2367,7 @@ class Wav2Vec2ForXVector(Wav2Vec2PreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -2379,6 +2391,7 @@ class Wav2Vec2ForXVector(Wav2Vec2PreTrainedModel):
 
         outputs = self.wav2vec2(
             input_values,
+            time,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
