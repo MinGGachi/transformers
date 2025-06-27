@@ -28,6 +28,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...integrations.deepspeed import is_deepspeed_zero3_enabled
@@ -58,11 +59,12 @@ from ...utils import (
     is_torch_flex_attn_available,
     logging,
 )
-from .configuration_wav2vec2 import Wav2Vec2Config
+from .configuration_wav2vec2 import TimeWav2Vec2Config
 
+# ode integrator
 from torchdiffeq import odeint_adjoint as odeint
 # Time Varying torch.nn.Module
-from speech_norm.src.model import SinusoidalEmbedding, Linear, LayerNorm
+from .model import SinusoidalEmbedding, Linear, LayerNorm
 
 WAV2VEC2_ADAPTER_PT_FILE = "adapter.{}.bin"
 WAV2VEC2_ADAPTER_SAFE_FILE = "adapter.{}.safetensors"
@@ -82,9 +84,9 @@ _HIDDEN_STATES_START_POSITION = 2
 
 
 @dataclass
-class Wav2Vec2ForPreTrainingOutput(ModelOutput):
+class TimeWav2Vec2ForPreTrainingOutput(ModelOutput):
     """
-    Output type of [`Wav2Vec2ForPreTraining`], with potential hidden states and attentions.
+    Output type of [`TimeWav2Vec2ForPreTraining`], with potential hidden states and attentions.
 
     Args:
         loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
@@ -520,7 +522,7 @@ class Wav2Vec2Attention(nn.Module):
         is_decoder: bool = False,
         bias: bool = True,
         is_causal: bool = False,
-        config: Optional[Wav2Vec2Config] = None,
+        config: Optional[TimeWav2Vec2Config] = None,
         # config must contain parameters for the time-varying modules
     ):
         super().__init__()
@@ -906,6 +908,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
+        solver_type='euler',
     ):
         all_hidden_states = () if output_hidden_states else None
         # TODO: how to get the attention weights?
@@ -930,7 +933,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
         closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask, output_attentions=False)
-        trajectory = odeint(closure_layer, hidden_states, time, method=self.config.solver_type)
+        trajectory = odeint(closure_layer, hidden_states, time, method=solver_type)
         
         hidden_states = trajectory[-1]
         hidden_states = self.layer_norm(hidden_states)
@@ -1121,9 +1124,9 @@ class Wav2Vec2AttnAdapterLayer(nn.Module):
 
 
 @auto_docstring
-class Wav2Vec2PreTrainedModel(PreTrainedModel):
-    config_class = Wav2Vec2Config
-    base_model_prefix = "wav2vec2"
+class TimeWav2Vec2PreTrainedModel(PreTrainedModel):
+    config_class = TimeWav2Vec2Config
+    base_model_prefix = "time_wav2vec2"
     main_input_name = "input_values"
     supports_gradient_checkpointing = True
     _supports_flash_attn_2 = True
@@ -1133,7 +1136,7 @@ class Wav2Vec2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Initialize the weights"""
         # Wav2Vec2ForPreTraining last 2 linear layers need standard Linear init.
-        if isinstance(module, Wav2Vec2ForPreTraining):
+        if isinstance(module, TimeWav2Vec2ForPreTraining):
             module.project_hid.reset_parameters()
             module.project_q.reset_parameters()
             module.project_hid._is_hf_initialized = True
@@ -1222,7 +1225,7 @@ class Wav2Vec2PreTrainedModel(PreTrainedModel):
                 for param_name, param in module.named_parameters():
                     adapter_weights[".".join([name, param_name])] = param
 
-        if isinstance(self, Wav2Vec2ForCTC):
+        if isinstance(self, TimeWav2Vec2ForCTC):
             for name, param in self.lm_head.named_parameters():
                 adapter_weights[".".join(["lm_head", name])] = param
 
@@ -1238,7 +1241,7 @@ class Wav2Vec2PreTrainedModel(PreTrainedModel):
                 self._init_weights(module)
 
         # init lm head
-        if isinstance(self, Wav2Vec2ForCTC):
+        if isinstance(self, TimeWav2Vec2ForCTC):
             self._init_weights(self.lm_head)
 
     def load_adapter(self, target_lang: str, force_load=True, **kwargs):
@@ -1437,8 +1440,8 @@ class Wav2Vec2PreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
-    def __init__(self, config: Wav2Vec2Config):
+class TimeWav2Vec2Model(TimeWav2Vec2PreTrainedModel):
+    def __init__(self, config: TimeWav2Vec2Config):
         super().__init__(config)
         self.config = config
         self.feature_extractor = Wav2Vec2FeatureEncoder(config)
@@ -1586,13 +1589,13 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
 
 @auto_docstring(
     custom_intro="""
-    Wav2Vec2 Model with a quantizer and `VQ` head on top.
+    TimeWav2Vec2 Model with a quantizer and `VQ` head on top.
     """
 )
-class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
-    def __init__(self, config: Wav2Vec2Config):
+class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
+    def __init__(self, config: TimeWav2Vec2Config):
         super().__init__(config)
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         self.dropout_features = nn.Dropout(config.feat_quantizer_dropout)
 
         self.quantizer = Wav2Vec2GumbelVectorQuantizer(config)
@@ -1649,6 +1652,25 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
         logits = logits / temperature
         return logits
 
+    def local_consistency_loss(self, outputs, high_cost_outputs, attention_mask=None):
+        L = len(outputs.hidden_states) - 1
+        outputs_stacked = torch.stack(outputs.hidden_states[1:])  # [L-1, batch, seq, hidden]
+        high_cost_stacked = torch.stack(high_cost_outputs.hidden_states[1:])  # [L-1, batch, seq, hidden]
+
+        if attention_mask is not None:
+            # [batch, seq] -> [L-1, batch, seq, hidden]
+            mask = attention_mask.unsqueeze(0).unsqueeze(-1).expand_as(outputs_stacked)
+            
+            diff = (outputs_stacked - high_cost_stacked.detach()) ** 2
+            masked_diff = diff * mask
+            loss = masked_diff.sum() / mask.sum()
+        else:
+            loss = F.mse_loss(outputs_stacked, high_cost_stacked.detach())
+        
+        loss = loss / L
+
+        return loss
+
     @auto_docstring
     def forward(
         self,
@@ -1660,7 +1682,7 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, Wav2Vec2ForPreTrainingOutput]:
+    ) -> Union[Tuple, TimeWav2Vec2ForPreTrainingOutput]:
         r"""
         mask_time_indices (`torch.BoolTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Indices to mask extracted features for contrastive loss. When in training mode, model learns to predict
@@ -1731,6 +1753,20 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
             return_dict=return_dict,
         )
 
+        with torch.no_grad():
+            high_cost_outputs = self.wav2vec2(
+                input_values,
+                time,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                mask_time_indices=mask_time_indices,
+                return_dict=return_dict,
+                solver_type=self.config.high_solver_type,
+            )
+
+        consistency_loss = self.local_consistency_loss(outputs, high_cost_outputs, attention_mask)
+
         # 1. project all transformed features (including masked) to final vq dim
         transformer_features = self.project_hid(outputs[0])
 
@@ -1792,14 +1828,16 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
             diversity_loss = ((num_codevectors - codevector_perplexity) / num_codevectors) * mask_time_indices.sum()
 
             # 8. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d
-            loss = contrastive_loss + self.config.diversity_loss_weight * diversity_loss
+            loss = contrastive_loss \
+                + self.config.diversity_loss_weight * diversity_loss \
+                    + self.config.consistency_loss_weight * consistency_loss
 
         if not return_dict:
             if loss is not None:
                 return (loss, transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
             return (transformer_features, quantized_features, codevector_perplexity) + outputs[2:]
 
-        return Wav2Vec2ForPreTrainingOutput(
+        return TimeWav2Vec2ForPreTrainingOutput(
             loss=loss,
             projected_states=transformer_features,
             projected_quantized_states=quantized_features,
@@ -1812,7 +1850,7 @@ class Wav2Vec2ForPreTraining(Wav2Vec2PreTrainedModel):
 
 
 @auto_docstring
-class Wav2Vec2ForMaskedLM(Wav2Vec2PreTrainedModel):
+class TimeWav2Vec2ForMaskedLM(TimeWav2Vec2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -1820,7 +1858,7 @@ class Wav2Vec2ForMaskedLM(Wav2Vec2PreTrainedModel):
             "The class `Wav2Vec2ForMaskedLM` is deprecated. Please use `Wav2Vec2ForCTC` instead.", FutureWarning
         )
 
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         self.dropout = nn.Dropout(config.final_dropout)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
 
@@ -1861,10 +1899,10 @@ class Wav2Vec2ForMaskedLM(Wav2Vec2PreTrainedModel):
 
 @auto_docstring(
     custom_intro="""
-    Wav2Vec2 Model with a `language modeling` head on top for Connectionist Temporal Classification (CTC).
+    TimeWav2Vec2 Model with a `language modeling` head on top for Connectionist Temporal Classification (CTC).
     """
 )
-class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
+class TimeWav2Vec2ForCTC(TimeWav2Vec2PreTrainedModel):
     def __init__(self, config, target_lang: Optional[str] = None):
         r"""
         target_lang (`str`, *optional*):
@@ -1874,7 +1912,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
         """
         super().__init__(config)
 
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         self.dropout = nn.Dropout(config.final_dropout)
 
         self.target_lang = target_lang
@@ -2022,7 +2060,7 @@ class Wav2Vec2ForCTC(Wav2Vec2PreTrainedModel):
     SUPERB Keyword Spotting.
     """
 )
-class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
+class TimeWav2Vec2ForSequenceClassification(TimeWav2Vec2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -2030,7 +2068,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
             raise ValueError(
                 "Sequence classification does not support the use of Wav2Vec2 adapters (config.add_adapter=True)"
             )
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         num_layers = config.num_hidden_layers + 1  # transformer layers + input embeddings
         if config.use_weighted_layer_sum:
             self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
@@ -2139,7 +2177,7 @@ class Wav2Vec2ForSequenceClassification(Wav2Vec2PreTrainedModel):
 
 
 @auto_docstring
-class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
+class TimeWav2Vec2ForAudioFrameClassification(TimeWav2Vec2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
@@ -2147,7 +2185,7 @@ class Wav2Vec2ForAudioFrameClassification(Wav2Vec2PreTrainedModel):
             raise ValueError(
                 "Audio frame classification does not support the use of Wav2Vec2 adapters (config.add_adapter=True)"
             )
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         num_layers = config.num_hidden_layers + 1  # transformer layers + input embeddings
         if config.use_weighted_layer_sum:
             self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
@@ -2305,11 +2343,11 @@ class TDNNLayer(nn.Module):
     Wav2Vec2 Model with an XVector feature extraction head on top for tasks like Speaker Verification.
     """
 )
-class Wav2Vec2ForXVector(Wav2Vec2PreTrainedModel):
+class TimeWav2Vec2ForXVector(TimeWav2Vec2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        self.wav2vec2 = Wav2Vec2Model(config)
+        self.wav2vec2 = TimeWav2Vec2Model(config)
         num_layers = config.num_hidden_layers + 1  # transformer layers + input embeddings
         if config.use_weighted_layer_sum:
             self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
@@ -2452,12 +2490,12 @@ class Wav2Vec2ForXVector(Wav2Vec2PreTrainedModel):
 
 
 __all__ = [
-    "Wav2Vec2ForAudioFrameClassification",
-    "Wav2Vec2ForCTC",
-    "Wav2Vec2ForMaskedLM",
-    "Wav2Vec2ForPreTraining",
-    "Wav2Vec2ForSequenceClassification",
-    "Wav2Vec2ForXVector",
-    "Wav2Vec2Model",
-    "Wav2Vec2PreTrainedModel",
+    "TimeWav2Vec2ForAudioFrameClassification",
+    "TimeWav2Vec2ForCTC",
+    "TimeWav2Vec2ForMaskedLM",
+    "TimeWav2Vec2ForPreTraining",
+    "TimeWav2Vec2ForSequenceClassification",
+    "TimeWav2Vec2ForXVector",
+    "TimeWav2Vec2Model",
+    "TimeWav2Vec2PreTrainedModel",
 ]

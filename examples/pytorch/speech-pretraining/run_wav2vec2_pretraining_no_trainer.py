@@ -34,14 +34,14 @@ from tqdm.auto import tqdm
 import transformers
 from transformers import (
     SchedulerType,
-    Wav2Vec2Config,
+    TimeWav2Vec2Config,
     Wav2Vec2FeatureExtractor,
-    Wav2Vec2ForPreTraining,
+    TimeWav2Vec2ForPreTraining,
     get_scheduler,
     is_wandb_available,
     set_seed,
 )
-from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
+from transformers.models.time_wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
 from transformers.utils import send_example_telemetry
 
 
@@ -273,6 +273,12 @@ def parse_args():
             " If omitted, will pull value from model config."
         ),
     )
+    parser.add_argument(
+        "--local_dataset_path",
+        type=str,
+        default=None,
+        help="Path to local dataset directory. If provided, loads dataset from local path instead of HuggingFace Hub.",
+    )
     args = parser.parse_args()
 
     if args.push_to_hub:
@@ -321,12 +327,14 @@ class DataCollatorForWav2Vec2Pretraining:
             originates from the original wav2vec 2.0 article and corresponds to the ``M`` variable mentioned there.
     """
 
-    model: Wav2Vec2ForPreTraining
+    model: TimeWav2Vec2ForPreTraining
     feature_extractor: Wav2Vec2FeatureExtractor
     padding: Union[bool, str] = "longest"
     pad_to_multiple_of: Optional[int] = None
     mask_time_prob: Optional[float] = 0.65
     mask_time_length: Optional[int] = 10
+    min_time_step: Optional[int] = 12
+    max_time_step: Optional[int] = 24
 
     def __call__(self, features: list[dict[str, Union[list[int], torch.Tensor]]]) -> dict[str, torch.Tensor]:
         # reformat list to dict and set to pytorch format
@@ -369,6 +377,10 @@ class DataCollatorForWav2Vec2Pretraining:
         )
         batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
         batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
+
+        L = torch.randint(self.min_time_step, self.max_time_step, (1,)).item()
+        time = torch.Tensor(torch.linspace(0, 1, L)).to(device)
+        batch["time"] = time
 
         return batch
 
@@ -448,15 +460,44 @@ def main():
     # ``args.dataset_config_names`` and ``args.dataset_split_names``
     datasets_splits = []
     for dataset_config_name, train_split_name in zip(args.dataset_config_names, args.dataset_split_names):
-        # load dataset
-        dataset_split = load_dataset(
-            args.dataset_name,
-            dataset_config_name,
-            split=train_split_name,
-            cache_dir=args.cache_dir,
-            trust_remote_code=args.trust_remote_code,
-            storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=60 * 60)}},
-        )
+        if args.local_dataset_path is not None:
+            # LibriSpeech 디렉토리 이름 매핑
+            def get_librispeech_dir_name(config_name, split_name):
+                # split_name에서 숫자 추출 (예: "train.100" -> "100")
+                if "." in split_name:
+                    split_type, hours = split_name.split(".")
+                    if split_type == "train":
+                        return f"train-{config_name}-{hours}"
+                    else:
+                        return f"{split_type}-{config_name}"
+                else:
+                    # validation/test splits
+                    return f"{split_name}-{config_name}"
+            
+            actual_dir_name = get_librispeech_dir_name(dataset_config_name, train_split_name)
+            dataset_dir = os.path.join(args.local_dataset_path, actual_dir_name)
+            
+            # Load from local path
+            dataset_split = load_dataset(
+                "audiofolder",
+                data_dir=dataset_dir,
+                split="train",  # audiofolder는 항상 "train" split을 사용
+                cache_dir=args.cache_dir,
+                trust_remote_code=args.trust_remote_code,
+            )
+            # Remove label column if it exists (wav2vec2 pre-training is unsupervised)
+            if "label" in dataset_split.column_names:
+                dataset_split = dataset_split.remove_columns(["label"])
+        else:
+            # HuggingFace Hub dataset (기존 방식)
+            dataset_split = load_dataset(
+                args.dataset_name,
+                dataset_config_name,
+                split=train_split_name,
+                cache_dir=args.cache_dir,
+                trust_remote_code=args.trust_remote_code,
+                storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=60 * 60)}},
+            )
         datasets_splits.append(dataset_split)
 
     # Next, we concatenate all configurations and splits into a single training dataset
@@ -543,7 +584,7 @@ def main():
         return
 
     # 3. Load model
-    config = Wav2Vec2Config.from_pretrained(args.model_name_or_path)
+    config = TimeWav2Vec2Config.from_pretrained(args.model_name_or_path)
 
     # pretraining is only supported for "newer" stable layer norm architecture
     # apply_spec_augment has to be True, mask_feature_prob has to be 0.0
@@ -554,7 +595,7 @@ def main():
         )
 
     # initialize random model
-    model = Wav2Vec2ForPreTraining(config)
+    model = TimeWav2Vec2ForPreTraining(config)
 
     # Activate gradient checkpointing if needed
     if args.gradient_checkpointing:
