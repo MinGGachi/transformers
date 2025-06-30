@@ -58,6 +58,7 @@ class SinusoidalEmbedding():
             * torch.arange(self.time_dim, dtype=time.dtype)
             / self.time_dim
             )
+        freq = freq.to(device=time.device, dtype=time.dtype)
         emb = scaled_time.reshape(-1, 1) * freq.reshape(1, -1)
         emb = torch.cat([time.reshape(-1, 1), torch.sin(emb), torch.cos(emb)], dim=1)
 

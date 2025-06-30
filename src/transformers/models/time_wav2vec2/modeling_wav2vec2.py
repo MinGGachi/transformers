@@ -720,7 +720,7 @@ class Wav2Vec2EncoderLayer(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None, 
                 output_attentions: bool = False
                 ):
-        sinusoidal_emb = self.sinusoidal_emb(time)
+        sinusoidal_emb = self.sinusoidal_emb(time).to(device=hidden_states.device, dtype=hidden_states.dtype)
         attn_residual = hidden_states
 
         hidden_states, attn_weights, _ = self.attention(
@@ -779,7 +779,7 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None, 
                 output_attentions: bool = False
                 ):
-        sinusoidal_emb = self.sinusoidal_emb(time)
+        sinusoidal_emb = self.sinusoidal_emb(time).to(device=hidden_states.device, dtype=hidden_states.dtype)
         attn_residual = hidden_states
 
         hidden_states = self.layer_norm(hidden_states, sinusoidal_emb)
@@ -821,7 +821,7 @@ class Wav2Vec2Encoder(nn.Module):
         time: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_hidden_states: bool = True,
         return_dict: bool = True,
     ):
         all_hidden_states = () if output_hidden_states else None
@@ -847,8 +847,10 @@ class Wav2Vec2Encoder(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
-        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask, output_attentions=False)
-        trajectory = odeint(closure_layer, hidden_states, time, method=self.config.solver_type)
+        attention_mask_copy = attention_mask.clone() if attention_mask is not None else None
+        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask_copy, output_attentions=False)[0]
+        with torch.autocast(device_type='cuda', enabled=False):
+            trajectory = odeint(closure_layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
         
         hidden_states = trajectory[-1]
 
@@ -884,6 +886,9 @@ class Wav2Vec2Encoder(nn.Module):
                 # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
                 attention_mask = _prepare_4d_attention_mask(attention_mask, inputs_embeds.dtype)
 
+            if attention_mask is not None and attention_mask.dtype != inputs_embeds.dtype:
+                attention_mask = attention_mask.to(inputs_embeds.dtype)
+
         return attention_mask
 
 
@@ -906,7 +911,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         time,
         attention_mask=None,
         output_attentions=False,
-        output_hidden_states=False,
+        output_hidden_states=True,
         return_dict=True,
         solver_type='euler',
     ):
@@ -932,12 +937,14 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
-        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask, output_attentions=False)
-        trajectory = odeint(closure_layer, hidden_states, time, method=solver_type)
+        attention_mask_copy = attention_mask.clone() if attention_mask is not None else None
+        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask_copy, output_attentions=False)[0]
+        with torch.autocast(device_type='cuda', enabled=False):
+            trajectory = odeint(closure_layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
         
         hidden_states = trajectory[-1]
         hidden_states = self.layer_norm(hidden_states)
-
+        
         if output_hidden_states:
             all_hidden_states = all_hidden_states + tuple(trajectory)
 
@@ -969,6 +976,9 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             else:
                 # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
                 attention_mask = _prepare_4d_attention_mask(attention_mask, inputs_embeds.dtype)
+
+            if attention_mask is not None and attention_mask.dtype != inputs_embeds.dtype:
+                attention_mask = attention_mask.to(inputs_embeds.dtype)
 
         return attention_mask
 
@@ -1536,6 +1546,7 @@ class TimeWav2Vec2Model(TimeWav2Vec2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        solver_type: Optional[str] = None,
     ) -> Union[Tuple, Wav2Vec2BaseModelOutput]:
         r"""
         mask_time_indices (`torch.BoolTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1569,6 +1580,7 @@ class TimeWav2Vec2Model(TimeWav2Vec2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            solver_type=solver_type,
         )
 
         hidden_states = encoder_outputs[0]
@@ -1660,7 +1672,6 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
         if attention_mask is not None:
             # [batch, seq] -> [L-1, batch, seq, hidden]
             mask = attention_mask.unsqueeze(0).unsqueeze(-1).expand_as(outputs_stacked)
-            
             diff = (outputs_stacked - high_cost_stacked.detach()) ** 2
             masked_diff = diff * mask
             loss = masked_diff.sum() / mask.sum()
@@ -1742,7 +1753,7 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
 
         if mask_time_indices is not None:
             mask_time_indices = mask_time_indices.to(torch.bool)
-
+        
         outputs = self.wav2vec2(
             input_values,
             time,
@@ -1751,6 +1762,7 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             output_hidden_states=output_hidden_states,
             mask_time_indices=mask_time_indices,
             return_dict=return_dict,
+            solver_type=self.config.solver_type,
         )
 
         with torch.no_grad():
@@ -1765,8 +1777,6 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
                 solver_type=self.config.high_solver_type,
             )
 
-        consistency_loss = self.local_consistency_loss(outputs, high_cost_outputs, attention_mask)
-
         # 1. project all transformed features (including masked) to final vq dim
         transformer_features = self.project_hid(outputs[0])
 
@@ -1778,7 +1788,10 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             attention_mask = self._get_feature_vector_attention_mask(
                 extract_features.shape[1], attention_mask, add_adapter=False
             )
+        # 3. compute consistency loss
+        consistency_loss = self.local_consistency_loss(outputs, high_cost_outputs, attention_mask)
 
+        # 4. quantize all (unmasked) extracted features and project to final vq dim
         quantized_features, codevector_perplexity = self.quantizer(
             extract_features, mask_time_indices=mask_time_indices
         )

@@ -228,9 +228,9 @@ class TimeWav2Vec2Config(PretrainedConfig):
         num_conv_pos_embedding_groups=16,
         do_stable_layer_norm=False,
         # start of time varying parameters
-        time_dim = 64,
-        hidden_dim = 128,
-        rank = 32,
+        time_dim = 32,
+        hidden_dim = 64,
+        rank = 64,
         time_activation = "silu",
         solver_type="euler",
         high_solver_type="midpoint",

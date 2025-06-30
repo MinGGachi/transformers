@@ -1,11 +1,15 @@
-NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
-CUDA_VISIBLE_DEVICES=6,7 accelerate launch \
-    --num_processes=2 \
+# --dataset_config_names clean clean other \
+# --dataset_split_names train.100 train.360 train.500 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+CUDA_VISIBLE_DEVICES=4 \
+accelerate launch \
+    --num_processes=1 \
     --mixed_precision=fp16 \
     run_wav2vec2_pretraining_no_trainer.py \
         --dataset_name=librispeech_asr \
-        --dataset_config_names clean clean other \
-        --dataset_split_names train.100 train.360 train.500 \
+        --dataset_config_names clean \
+        --dataset_split_names train.100 \
         --model_name_or_path="patrickvonplaten/wav2vec2-base-v2" \
         --output_dir="./wav2vec2-pretrained-demo" \
         --max_train_steps="200000" \
@@ -24,5 +28,5 @@ CUDA_VISIBLE_DEVICES=6,7 accelerate launch \
         --adam_epsilon="1e-06" \
         --mask_time_prob="0.65" \
         --mask_time_length="10" \
-        --local_dataset_path="/data/LibriSpeech" \
+        --local_dataset_path="/ssd1/libri/LibriSpeech" \
         --cache_dir="/workspace/speech_norm/cache"

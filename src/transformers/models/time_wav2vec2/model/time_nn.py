@@ -59,7 +59,7 @@ class TimeModule():
     def _weight_sum_with_bias(self,
                               sinusoidal_emb: Tensor,
                               )-> Tuple[Tensor, Tensor]:
-        unshaped_weight = self.weight_generator(sinusoidal_emb)
+        unshaped_weight = self.weight_generator(sinusoidal_emb).to(dtype=self.weight.dtype)
         weight, bias = self.reshape_weight(unshaped_weight)
 
         weight_ = self.weight + weight
@@ -70,7 +70,7 @@ class TimeModule():
     def _weight_sum_without_bias(self,
                                  sinusoidal_emb: Tensor,
                                  )-> Tuple[Tensor, None]:
-        unshaped_weight = self.weight_generator(sinusoidal_emb)
+        unshaped_weight = self.weight_generator(sinusoidal_emb).to(dtype=self.weight.dtype)
         weight, _ = self.reshape_weight(unshaped_weight)
         
         weight_ = self.weight + weight
@@ -272,8 +272,10 @@ class LayerNorm(nn.LayerNorm, TimeModule):
                             activation=activation)
         
         if self.bias is not None:
+            self._weight_sum = self._weight_sum_with_bias
             self._reshape_impl = self._reshape_with_bias
         else:
+            self._weight_sum = self._weight_sum_without_bias
             self._reshape_impl = self._reshape_without_bias
 
     def _reshape_with_bias(self,

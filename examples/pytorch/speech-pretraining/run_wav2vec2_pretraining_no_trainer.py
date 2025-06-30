@@ -681,7 +681,7 @@ def main():
             percent_masked = num_losses / sub_attention_mask.sum()
 
             # forward
-            outputs = model(**batch)
+            outputs = model(**batch, output_hidden_states=True)
 
             # divide loss by gradient accumulation steps since gradients
             # are accumulated for multiple backward passes in PyTorch
