@@ -1,30 +1,34 @@
 #! /usr/bin/env python3
 # written by Min Jun Choi
 # Music & Audio Research Group, Seoul National University
-# Last modified: 25.06.20
+# Last modified: 25.07.24
 
 from typing import Tuple, Optional, Union
 from torch import Tensor
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 from .weight_generator import WeightGenerator
 
 
-class TimeModule():
+class TimeModule(nn.Module):
     """
     This module CAN NOT be used as a standalone module.
     You should use it as a base class for other modules.
     """
     def __init__(self,
+                 *,
                  module: nn.Module,
                  rank: int,
                  time_dim: int,
                  hidden_dim: int,
                  activation: nn.Module = nn.SiLU(),
+                 scale_init: float = 0.0,
+                 eps: float = 1e-4,
+                 **layer_kwargs,
                  ):
         """
         Args:
@@ -34,7 +38,10 @@ class TimeModule():
             hidden_dim (int): dimension of the hidden layer
             activation (nn.Module): activation function
         """
+        super().__init__(**layer_kwargs)
         self.rank = rank
+        self.scale_init = scale_init
+        self.eps = eps
         self.weight_generator = WeightGenerator(module=module,
                                                 rank=rank,
                                                 time_dim=time_dim,
@@ -53,32 +60,36 @@ class TimeModule():
         Returns:
             Tuple[Tensor, Optional[Tensor]]: reshaped weight and bias(optional)
         """
-        #### self._reshape_impl must be implemented in the child class ####
+        #### self._reshape_impl MUST be implemented in the child class ####
         return self._reshape_impl(unshaped_weight)
     
     def _weight_sum_with_bias(self,
-                              sinusoidal_emb: Tensor,
+                              unshaped_weight: Tensor,
+                              raw_scaling_factor: Tensor,
                               )-> Tuple[Tensor, Tensor]:
-        unshaped_weight = self.weight_generator(sinusoidal_emb).to(dtype=self.weight.dtype)
-        weight, bias = self.reshape_weight(unshaped_weight)
+        with autocast(enabled=False):
+            weight, bias = self.reshape_weight(unshaped_weight)
+            scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
 
-        weight_ = self.weight + weight
-        bias_ = self.bias + bias
+            weight_ = self.weight + scaling_factor * weight / self.rank
+            bias_ = self.bias + scaling_factor * bias / self.rank
 
         return weight_, bias_
     
     def _weight_sum_without_bias(self,
-                                 sinusoidal_emb: Tensor,
+                                 unshaped_weight: Tensor,
+                                 raw_scaling_factor: Tensor,
                                  )-> Tuple[Tensor, None]:
-        unshaped_weight = self.weight_generator(sinusoidal_emb).to(dtype=self.weight.dtype)
-        weight, _ = self.reshape_weight(unshaped_weight)
-        
-        weight_ = self.weight + weight
+        with autocast(enabled=False):
+            weight, _ = self.reshape_weight(unshaped_weight)
+            scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
+
+            weight_ = self.weight + scaling_factor * weight / self.rank
 
         return weight_, None
-        
-        
-class Linear(nn.Linear, TimeModule):
+
+
+class Linear(TimeModule, nn.Linear):
     """
     A module that encapsulates nn.Linear and generates LoRA style time-dynamic weights and biases.
     """
@@ -97,16 +108,14 @@ class Linear(nn.Linear, TimeModule):
             out_features (int): output feature dimension
             kwargs (dict): keyword arguments for nn.Linear
         """
-        nn.Linear.__init__(self, 
-                           in_features=in_features, 
-                           out_features=out_features, 
-                           **kwargs)
-        TimeModule.__init__(self, 
-                            module=self, 
-                            rank=rank, 
-                            time_dim=time_dim, 
-                            hidden_dim=hidden_dim, 
-                            activation=activation)
+        super().__init__(in_features=in_features, 
+                         out_features=out_features,
+                         module=self,
+                         rank=rank,
+                         time_dim=time_dim,
+                         hidden_dim=hidden_dim,
+                         activation=activation,
+                         **kwargs)
         
         if self.bias is not None:
             self._weight_sum = self._weight_sum_with_bias
@@ -154,12 +163,13 @@ class Linear(nn.Linear, TimeModule):
             x (Tensor): input tensor
             sinusoidal_emb (Tensor): time embedding
         """
-        weight, bias = self._weight_sum(sinusoidal_emb)
+        unshaped_weight, scaling_factor = self.weight_generator(sinusoidal_emb)
+        weight, bias = self._weight_sum(unshaped_weight, scaling_factor)
 
         return F.linear(x, weight=weight, bias=bias)
 
 
-class Conv1d(nn.Conv1d, TimeModule):
+class Conv1d(TimeModule, nn.Conv1d):
     """
     A module that encapsulates nn.Conv1d and generates LoRA style time-dynamic weights and biases.
     """
@@ -180,17 +190,15 @@ class Conv1d(nn.Conv1d, TimeModule):
             kernel_size (Union[int, Tuple[int]]): kernel size
             kwargs (dict): keyword arguments for nn.Conv1d
         """
-        nn.Conv1d.__init__(self, 
-                           in_channels=in_channels, 
-                           out_channels=out_channels, 
-                           kernel_size=kernel_size,
-                           **kwargs)
-        TimeModule.__init__(self, 
-                            module=self, 
-                            rank=rank, 
-                            time_dim=time_dim, 
-                            hidden_dim=hidden_dim, 
-                            activation=activation)
+        super().__init__(in_channels=in_channels, 
+                         out_channels=out_channels, 
+                         kernel_size=kernel_size,
+                         module=self,
+                         rank=rank,
+                         time_dim=time_dim,
+                         hidden_dim=hidden_dim,
+                         activation=activation,
+                         **kwargs)
         
         if self.bias is not None:
             self._weight_sum = self._weight_sum_with_bias
@@ -239,14 +247,15 @@ class Conv1d(nn.Conv1d, TimeModule):
             x (Tensor): input tensor
             sinusoidal_emb (Tensor): time embedding
         """
-        weight, bias = self._weight_sum(sinusoidal_emb)
+        unshaped_weight, scaling_factor = self.weight_generator(sinusoidal_emb)
+        weight, bias = self._weight_sum(unshaped_weight, scaling_factor)
 
         return self._conv_forward(x, weight=weight, bias=bias)
 
 
-class LayerNorm(nn.LayerNorm, TimeModule):
+class LayerNorm(TimeModule, nn.LayerNorm):
     """
-    A module that encapsulates nn.LayerNorm and generates time-dynamic weights and biases.
+    A module that encapsulates nn.LayerNorm and generates time-dynamic weights.
     """
     def __init__(self,
                  normalized_shape: int,
@@ -261,39 +270,28 @@ class LayerNorm(nn.LayerNorm, TimeModule):
             normalized_shape (int): dimension of the normalized shape
             kwargs (dict): keyword arguments for nn.LayerNorm
         """
-        nn.LayerNorm.__init__(self, 
-                              normalized_shape=normalized_shape,
-                              **kwargs)
-        TimeModule.__init__(self, 
-                            module=self, 
-                            rank=rank, 
-                            time_dim=time_dim, 
-                            hidden_dim=hidden_dim, 
-                            activation=activation)
-        
-        if self.bias is not None:
-            self._weight_sum = self._weight_sum_with_bias
-            self._reshape_impl = self._reshape_with_bias
-        else:
-            self._weight_sum = self._weight_sum_without_bias
-            self._reshape_impl = self._reshape_without_bias
-
-    def _reshape_with_bias(self,
-                           unshaped_weight: Tensor
-                           )-> Tuple[Tensor, Tensor]:
-        weight, bias = unshaped_weight.split([math.prod(self.normalized_shape), 
-                                              math.prod(self.normalized_shape)], 
-                                              dim=-1)
-
-        return weight.view(self.weight.shape), bias.view(self.bias.shape)
+        if rank > 1:
+            print("in LayerNorm, rank doesn't affect the dimension of weights and biases")
+            rank = 1
+        super().__init__(normalized_shape=normalized_shape, 
+                         module=self,
+                         rank=rank,
+                         time_dim=time_dim,
+                         hidden_dim=hidden_dim,
+                         activation=activation,
+                         **kwargs)
+        self._reshape_impl = self._reshape_without_bias
+        self._weight_sum = self._weight_sum_without_bias
     
     def _reshape_without_bias(self,
-                              unshaped_weight: Tensor
-                              )-> Tuple[Tensor, None]:
+                 unshaped_weight: Tensor
+                 )-> Tuple[Tensor, None]:
+
+        unshaped_weight = F.tanh(unshaped_weight)
         weight = unshaped_weight.view(self.normalized_shape)
 
         return weight.view(self.weight.shape), None
-    
+
     def forward(self, 
                 x: Tensor,
                 sinusoidal_emb: Tensor,
@@ -303,9 +301,10 @@ class LayerNorm(nn.LayerNorm, TimeModule):
             x (Tensor): input tensor
             sinusoidal_emb (Tensor): time embedding
         """
-        weight, bias = self._weight_sum(sinusoidal_emb)
+        unshaped_weight, scaling_factor = self.weight_generator(sinusoidal_emb)
+        weight, _ = self._weight_sum(unshaped_weight, scaling_factor)
 
-        return F.layer_norm(x, normalized_shape=self.normalized_shape, weight=weight, bias=bias)
+        return F.layer_norm(x, normalized_shape=self.normalized_shape, weight=weight, bias=self.bias)
     
 
 __all__ = ["Linear", 

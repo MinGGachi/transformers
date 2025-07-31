@@ -23,6 +23,7 @@ from typing import Optional, Union
 
 import aiohttp
 import datasets
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -35,16 +36,13 @@ import transformers
 from transformers import (
     SchedulerType,
     TimeWav2Vec2Config,
-    Wav2Vec2Config,
     Wav2Vec2FeatureExtractor,
     TimeWav2Vec2ForPreTraining,
-    Wav2Vec2ForPreTraining,
     get_scheduler,
     is_wandb_available,
     set_seed,
 )
-# from transformers.models.time_wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
-from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
+from transformers.models.time_wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
 from transformers.utils import send_example_telemetry
 
 
@@ -238,7 +236,6 @@ def parse_args():
     parser.add_argument(
         "--adam_beta1",
         type=float,
-        default=0.9,
         help="Beta1 for AdamW optimizer",
     )
     parser.add_argument(
@@ -331,7 +328,7 @@ class DataCollatorForWav2Vec2Pretraining:
     """
 
     # model: TimeWav2Vec2ForPreTraining
-    model: Wav2Vec2ForPreTraining
+    model: TimeWav2Vec2ForPreTraining
     feature_extractor: Wav2Vec2FeatureExtractor
     padding: Union[bool, str] = "longest"
     pad_to_multiple_of: Optional[int] = None
@@ -386,9 +383,15 @@ class DataCollatorForWav2Vec2Pretraining:
         # end_time = torch.Tensor([1.0])
         # middle_times = torch.rand(self.time_step - 1)
         # middle_times = torch.sort(middle_times)[0]
+        # middle_times = torch.linspace(0.0, 1.0, self.time_step - 1)
         # time = torch.cat([start_time, middle_times, end_time]).to(device)
+        # min_time_step = 8
+        # max_time_step = 16
+        # time_step = np.random.randint(min_time_step, max_time_step + 1)
+        time_step = self.time_step
+        time = torch.linspace(0.0, 1.0, time_step + 1).to(device)
         
-        # batch["time"] = time
+        batch["time"] = time
 
         return batch
 
@@ -592,8 +595,7 @@ def main():
         return
 
     # 3. Load model
-    # config = TimeWav2Vec2Config.from_pretrained(args.model_name_or_path)
-    config = Wav2Vec2Config.from_pretrained(args.model_name_or_path)
+    config = TimeWav2Vec2Config.from_pretrained(args.model_name_or_path)
 
     # pretraining is only supported for "newer" stable layer norm architecture
     # apply_spec_augment has to be True, mask_feature_prob has to be 0.0
@@ -604,8 +606,7 @@ def main():
         )
 
     # initialize random model
-    # model = TimeWav2Vec2ForPreTraining(config)
-    model = Wav2Vec2ForPreTraining(config)
+    model = TimeWav2Vec2ForPreTraining(config)
 
     # Activate gradient checkpointing if needed
     if args.gradient_checkpointing:
@@ -722,6 +723,7 @@ def main():
                     grad_norm = get_grad_norm(model.parameters(), scale)
 
                 # update parameters
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
                 optimizer.step()
                 optimizer.zero_grad()
 

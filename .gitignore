@@ -170,3 +170,9 @@ tags
 
 # wandb
 examples/pytorch/speech-pretraining/wandb
+examples/pytorch/speech-pretraining/wav2vec2-pretrained-demo
+examples/pytorch/speech-pretraining/run.sh
+examples/pytorch/speech-pretraining-time/wandb
+examples/pytorch/speech-pretraining-time/run.sh
+examples/pytorch/speech-pretraining-time16/wandb
+examples/pytorch/speech-pretraining-time16/run.sh

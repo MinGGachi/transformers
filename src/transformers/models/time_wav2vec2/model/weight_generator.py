@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 # written by Min Jun Choi
 # Music & Audio Research Group, Seoul National University
-# Last modified: 25.06.18
+# Last modified: 25.07.24
 
 """
 this module generates time-dynamic LoRA style weights and biases for nn.Linear, nn.Conv1d, nn.LayerNorm.
@@ -17,9 +17,9 @@ from torch import Tensor
 import math
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast
 
 
-# TODO: check Conv1d's LoRA style weight generation
 class WeightGenerator(nn.Module):
     """
     This neural network generates dynamic weights and biases based on time embeddings,
@@ -55,7 +55,8 @@ class WeightGenerator(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             activation,
         )
-        self.projection = nn.Linear(hidden_dim, target_dim)
+        self.projection_dir = nn.Linear(hidden_dim, target_dim)
+        self.projection_scale = nn.Linear(hidden_dim, 1)
 
     def target_dim(self,
                    module: Union[nn.Linear, nn.Conv1d, nn.LayerNorm],
@@ -71,11 +72,12 @@ class WeightGenerator(nn.Module):
             return rank * (module.in_features + module.out_features) \
                 + int(bias) * module.out_features
         elif isinstance(module, nn.Conv1d):
-            return rank * module.kernel_size[0] \
-                * (module.in_channels // module.groups * module.kernel_size[0] + module.out_channels) \
+            return rank * math.prod(module.kernel_size) \
+                * (module.in_channels // module.groups * math.prod(module.kernel_size) + module.out_channels) \
                 + int(bias) * module.out_channels
         elif isinstance(module, nn.LayerNorm):
-            return math.prod(module.normalized_shape) * (1 + int(bias))
+            # LayerNorm doesn't have bias and rank doesn't affect the dimension of weights and biases
+            return math.prod(module.normalized_shape)
 
     def forward(self,
                 sinusoidal_emb: Tensor,
@@ -89,6 +91,11 @@ class WeightGenerator(nn.Module):
         Returns:
             weight (torch.Tensor): Time-dynamic unshaped weights for the target module.
         """
-        # Proj(MLP(Sinusoidal Embedding(time)))
 
-        return self.projection(self.mlp(sinusoidal_emb))
+        mlp_out = self.mlp(sinusoidal_emb)
+        
+        with autocast(enabled=False):
+            unshaped_weight = self.projection_dir(mlp_out)
+            raw_scaling_factor = self.projection_scale(mlp_out)
+
+        return unshaped_weight, raw_scaling_factor

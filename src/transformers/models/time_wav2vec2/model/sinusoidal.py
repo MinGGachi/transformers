@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 # written by Min Jun Choi
 # Music & Audio Research Group, Seoul National University
-# Last modified: 25.06.06
+# Last modified: 25.07.24
 
 """
 this module generates sinusoidal embeddings for time-varying modules.
@@ -19,11 +19,13 @@ import torch
 import torch.nn as nn
 
 
-class SinusoidalEmbedding():
+class SinusoidalEmbedding(nn.Module):
+    """Fourier features for time-varying modules."""
     def __init__(self,
                  time_dim: int = 128,
                  max_period: int = 10000,
                  scale: int = 1000,
+                 requires_grad: bool = True,
                  ):
         """
         Args:
@@ -31,41 +33,36 @@ class SinusoidalEmbedding():
             max_period (int): Maximum period of sinusoidal features.
             scale (int): Scaling factor for time.
         """
+        super().__init__()
         self.time_dim = time_dim
-        self.max_period = max_period
         self.scale = scale
+        self.requires_grad = requires_grad
 
-    def __call__(self,
-                 time: Tensor,
-                 ) -> Tensor:
+        freq = torch.exp(
+            -torch.log(torch.tensor(max_period))
+            * torch.arange(self.time_dim)
+            / self.time_dim
+        )
+        self.register_buffer("freq", freq)
+
+    def forward(self, time: Tensor) -> Tensor:
         """
-        For generating time-varying weights for encoder layer.
-
         Args:
-            time (torch.Tensor): Tensor of timesteps with length L.
+            time (torch.Tensor): Tensor of timestep or sequence of timesteps with length L.
 
         Returns:
             emb (torch.Tensor): Fourier features with length 2 * sinusoidal_dim + 1.
         """
-        assert len(time.shape) in [0, 1], "time must be a 0D or 1D tensor"
-        if len(time.shape) == 0:
-            time = time.reshape(-1)
+        # Check if time requires grad
+        requires_grad = self.requires_grad or time.requires_grad
 
-        max_period = torch.tensor(self.max_period, dtype=time.dtype)
+        assert time.dim() in [0, 1], "time must be a 0D or 1D tensor"
+        
+        if time.dim() == 0:
+            time = time.reshape(-1)
+        
         scaled_time = time * self.scale
-        freq = torch.exp(
-            -torch.log(max_period)
-            * torch.arange(self.time_dim, dtype=time.dtype)
-            / self.time_dim
-            )
-        freq = freq.to(device=time.device, dtype=time.dtype)
-        emb = scaled_time.reshape(-1, 1) * freq.reshape(1, -1)
+        emb = scaled_time.reshape(-1, 1) * self.freq.reshape(1, -1)
         emb = torch.cat([time.reshape(-1, 1), torch.sin(emb), torch.cos(emb)], dim=1)
 
-        return emb.squeeze(0)
-    
-
-class LearnableSinusoidalEmbedding(nn.Module):
-    # TODO: Think about this class's efficiency
-    # does it better than SinusoidalEmbedding?
-    pass
+        return emb.squeeze(0).requires_grad_(requires_grad)

@@ -64,7 +64,7 @@ from .configuration_wav2vec2 import TimeWav2Vec2Config
 # ode integrator
 from torchdiffeq import odeint_adjoint as odeint
 # Time Varying torch.nn.Module
-from .model import SinusoidalEmbedding, Linear, LayerNorm
+from .model import SinusoidalEmbedding, WeightGenerator, Linear, LayerNorm
 
 WAV2VEC2_ADAPTER_PT_FILE = "adapter.{}.bin"
 WAV2VEC2_ADAPTER_SAFE_FILE = "adapter.{}.safetensors"
@@ -123,6 +123,7 @@ class TimeWav2Vec2ForPreTrainingOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     contrastive_loss: Optional[torch.FloatTensor] = None
     diversity_loss: Optional[torch.FloatTensor] = None
+    consistency_loss: Optional[torch.FloatTensor] = None
 
 
 def _compute_mask_indices(
@@ -686,11 +687,19 @@ class Wav2Vec2FeedForward(nn.Module):
         hidden_states = self.output_dropout(hidden_states)
         return hidden_states
 
-
+# TODO: Check buffer dtype
 class Wav2Vec2EncoderLayer(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
         super().__init__()
+
+        # to make Wav2Vec2EncoderLayer compatible with torchdiffeq,
+        # we need to register mask as abuffer
+        self.register_buffer('attention_mask', None, persistent=False)
+        # to hook the attention weights
+        self.output_attentions = False
+        self.attn_weights: dict[float, torch.Tensor] = {}
+
         # for time-varying modules
         self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
         if isinstance(config.time_activation, str):
@@ -714,17 +723,18 @@ class Wav2Vec2EncoderLayer(nn.Module):
                                           rank=config.rank, time_dim=config.time_dim,
                                           hidden_dim=config.hidden_dim, activation=self.time_activation)
 
+    def set_mask(self, mask: Optional[torch.Tensor] = None):
+        self.attention_mask = mask
+
     def forward(self, 
                 time: torch.Tensor,
-                hidden_states: torch.Tensor, 
-                attention_mask: Optional[torch.Tensor] = None, 
-                output_attentions: bool = False
+                hidden_states: torch.Tensor,
                 ):
-        sinusoidal_emb = self.sinusoidal_emb(time).to(device=hidden_states.device, dtype=hidden_states.dtype)
+        sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
 
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, sinusoidal_emb, attention_mask=attention_mask, output_attentions=output_attentions
+            hidden_states, sinusoidal_emb, attention_mask=self.attention_mask, output_attentions=self.output_attentions
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
@@ -733,18 +743,25 @@ class Wav2Vec2EncoderLayer(nn.Module):
         hidden_states = hidden_states + self.feed_forward(hidden_states, sinusoidal_emb)
         hidden_states = self.final_layer_norm(hidden_states, sinusoidal_emb)
 
-        outputs = (hidden_states,)
+        if self.output_attentions:
+            time_key = time.detach().cpu()
+            self.attn_weights[time_key] = attn_weights.detach().cpu()
 
-        if output_attentions:
-            outputs += (attn_weights,)
+        return hidden_states
 
-        return outputs
-
-
+# TODO: Check buffer dtype
 class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
         super().__init__()
+
+        # to make Wav2Vec2EncoderLayerStableLayerNorm compatible with torchdiffeq, 
+        # we need to register mask as abuffer
+        self.register_buffer('attention_mask', None, persistent=False)
+        # to hook the attention weights
+        self.output_attentions = False
+        self.attn_weights: dict[float, torch.Tensor] = {}
+
         # for time-varying modules
         self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
         if isinstance(config.time_activation, str):
@@ -772,19 +789,20 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
             self.adapter_layer = Wav2Vec2AttnAdapterLayer(config)
         else:
             self.adapter_layer = None
+    
+    def set_mask(self, mask: Optional[torch.Tensor] = None):
+        self.attention_mask = mask
 
     def forward(self, 
                 time: torch.Tensor,
-                hidden_states: torch.Tensor, 
-                attention_mask: Optional[torch.Tensor] = None, 
-                output_attentions: bool = False
+                hidden_states: torch.Tensor,
                 ):
-        sinusoidal_emb = self.sinusoidal_emb(time).to(device=hidden_states.device, dtype=hidden_states.dtype)
+        sinusoidal_emb = self.sinusoidal_emb(time)
         attn_residual = hidden_states
 
         hidden_states = self.layer_norm(hidden_states, sinusoidal_emb)
         hidden_states, attn_weights, _ = self.attention(
-            hidden_states, sinusoidal_emb, attention_mask=attention_mask, output_attentions=output_attentions
+            hidden_states, sinusoidal_emb, attention_mask=self.attention_mask, output_attentions=self.output_attentions
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = attn_residual + hidden_states
@@ -795,15 +813,15 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         if self.adapter_layer is not None:
             hidden_states = hidden_states + self.adapter_layer(hidden_states)
 
-        outputs = (hidden_states,)
+        if self.output_attentions:
+            time_key = time.detach().cpu()
+            self.attn_weights[time_key] = attn_weights.detach().cpu()
 
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        return hidden_states
     
 
 class Wav2Vec2Encoder(nn.Module):
+    # Encoder has solver(torchdiffeq) and time-varying 1 encoder layer
     def __init__(self, config):
         super().__init__()
 
@@ -811,7 +829,6 @@ class Wav2Vec2Encoder(nn.Module):
         self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        # self.layers = nn.ModuleList([Wav2Vec2EncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.layer = Wav2Vec2EncoderLayer(config)
         self.gradient_checkpointing = False
 
@@ -823,9 +840,9 @@ class Wav2Vec2Encoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = True,
         return_dict: bool = True,
+        solver_type='euler',
     ):
         all_hidden_states = () if output_hidden_states else None
-        # TODO: how to get the attention weights?
         all_self_attentions = () if output_attentions else None
 
         if attention_mask is not None:
@@ -847,15 +864,18 @@ class Wav2Vec2Encoder(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
-        attention_mask_copy = attention_mask.clone() if attention_mask is not None else None
-        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask_copy, output_attentions=False)[0]
-        with torch.autocast(device_type='cuda', enabled=False):
-            trajectory = odeint(closure_layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
+        self.layer.output_attentions = output_attentions
+        if attention_mask is not None:
+            self.layer.set_mask(attention_mask)
+        trajectory = odeint(self.layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
         
-        hidden_states = trajectory[-1]
-
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + tuple(trajectory)
+            all_hidden_states = all_hidden_states + tuple(trajectory[i] for i in range(0, len(trajectory)))
+
+        if output_attentions:
+            all_self_attentions = tuple(self.layer.attn_weights.items())
+
+        hidden_states = trajectory[-1]
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
@@ -893,15 +913,13 @@ class Wav2Vec2Encoder(nn.Module):
 
 
 class Wav2Vec2EncoderStableLayerNorm(nn.Module):
+    # Encoder has solver(torchdiffeq) and time-varying 1 encoder layer
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.pos_conv_embed = Wav2Vec2PositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        # self.layers = nn.ModuleList(
-        #     [Wav2Vec2EncoderLayerStableLayerNorm(config) for _ in range(config.num_hidden_layers)]
-        # )
         self.layer = Wav2Vec2EncoderLayerStableLayerNorm(config)
         self.gradient_checkpointing = False
 
@@ -916,7 +934,6 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         solver_type='euler',
     ):
         all_hidden_states = () if output_hidden_states else None
-        # TODO: how to get the attention weights?
         all_self_attentions = () if output_attentions else None
 
         if attention_mask is not None:
@@ -937,16 +954,18 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         # using torchdiffeq, modeling the sequence of neural ODEs.
-        attention_mask_copy = attention_mask.clone() if attention_mask is not None else None
-        closure_layer = lambda t, y: self.layer(t, y, attention_mask=attention_mask_copy, output_attentions=False)[0]
-        with torch.autocast(device_type='cuda', enabled=False):
-            trajectory = odeint(closure_layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
-        
-        hidden_states = trajectory[-1]
-        hidden_states = self.layer_norm(hidden_states)
+        self.layer.output_attentions = output_attentions
+        if attention_mask is not None:
+            self.layer.set_mask(attention_mask)
+        trajectory = odeint(self.layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
         
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + tuple(trajectory)
+            all_hidden_states = all_hidden_states + tuple(trajectory[i] for i in range(0, len(trajectory)))
+
+        if output_attentions:
+            all_self_attentions = tuple(self.layer.attn_weights.items())
+
+        hidden_states = trajectory[-1]
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
@@ -1167,6 +1186,11 @@ class TimeWav2Vec2PreTrainedModel(PreTrainedModel):
             k = math.sqrt(1 / module.projection.in_features)
             nn.init.uniform_(module.projection.weight, a=-k, b=k)
             nn.init.uniform_(module.projection.bias, a=-k, b=k)
+        elif isinstance(module, WeightGenerator):
+            nn.init.zeros_(module.projection_dir.weight)
+            nn.init.zeros_(module.projection_dir.bias)
+            nn.init.zeros_(module.projection_scale.weight)
+            nn.init.zeros_(module.projection_scale.bias)
         elif isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
 
@@ -1181,6 +1205,28 @@ class TimeWav2Vec2PreTrainedModel(PreTrainedModel):
             if module.bias is not None:
                 k = math.sqrt(module.groups / (module.in_channels * module.kernel_size[0]))
                 nn.init.uniform_(module.bias, a=-k, b=k)
+
+    # def _init_weights_from_pretrained(
+    #     self, 
+    #     state_dict: dict,
+    #     option: Optional[str, int]="merge"
+    # ):
+    #     """
+    #     Load pretrained weights and update the model time-dependent weights.
+    #     There's two options:
+    #     - "merge": merge all layers of the pretrained weights with the model weights
+    #     - layer_idx: update the layer at layer_idx with the pretrained weights
+    #     """
+    #     # TODO: Implement loading the pretrained weights
+    #     # We expect that the ckpt follows Huggingface's state_dict format
+    #     if option == "merge":
+    #         # load the averaged weights of the pretrained model across all layers
+    #         pass
+    #     elif isinstance(option, int) and 0 <= option < len(self.encoder.layers):
+    #         # load the weights of the layer at layer_idx
+    #         pass
+    #     else:
+    #         raise ValueError(f"Invalid option: {option}")
 
     def _get_feat_extract_output_lengths(
         self, input_lengths: Union[torch.LongTensor, int], add_adapter: Optional[bool] = None
@@ -1664,21 +1710,23 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
         logits = logits / temperature
         return logits
 
-    def local_consistency_loss(self, outputs, high_cost_outputs, attention_mask=None):
+    def compute_consistency_loss(self, outputs, highcost_outputs, attention_mask=None):
+        # -1 is for excluding the transformer encoder input
         L = len(outputs.hidden_states) - 1
-        outputs_stacked = torch.stack(outputs.hidden_states[1:])  # [L-1, batch, seq, hidden]
-        high_cost_stacked = torch.stack(high_cost_outputs.hidden_states[1:])  # [L-1, batch, seq, hidden]
+
+        outputs_stacked = torch.stack(outputs.hidden_states[1:], dim=0)
+        highcost_outputs_stacked = torch.stack(highcost_outputs.hidden_states[1:], dim=0).detach()
 
         if attention_mask is not None:
-            # [batch, seq] -> [L-1, batch, seq, hidden]
-            mask = attention_mask.unsqueeze(0).unsqueeze(-1).expand_as(outputs_stacked)
-            diff = (outputs_stacked - high_cost_stacked.detach()) ** 2
-            masked_diff = diff * mask
-            loss = masked_diff.sum() / mask.sum()
+            mask = attention_mask.unsqueeze(-1).float()
+            outputs_masked = outputs_stacked * mask
+            highcost_outputs_masked = highcost_outputs_stacked * mask
+            loss = F.mse_loss(outputs_masked, highcost_outputs_masked, reduction='sum') / (highcost_outputs_masked ** 2).sum()
         else:
-            loss = F.mse_loss(outputs_stacked, high_cost_stacked.detach())
-        
-        loss = loss / L
+            loss = F.mse_loss(outputs_stacked, highcost_outputs_stacked, reduction='sum') / (highcost_outputs_stacked ** 2).sum()
+
+        # compensate the solver's error about time step size
+        loss = loss * (L ** 2)
 
         return loss
 
@@ -1765,17 +1813,18 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             solver_type=self.config.solver_type,
         )
 
-        with torch.no_grad():
-            high_cost_outputs = self.wav2vec2(
-                input_values,
-                time,
-                attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                mask_time_indices=mask_time_indices,
-                return_dict=return_dict,
-                solver_type=self.config.high_solver_type,
-            )
+        if self.config.high_solver_type is not None:
+            with torch.no_grad():
+                highcost_outputs = self.wav2vec2(
+                    input_values,
+                    time,
+                    attention_mask=attention_mask,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    mask_time_indices=mask_time_indices,
+                    return_dict=return_dict,
+                    solver_type=self.config.high_solver_type,
+                )
 
         # 1. project all transformed features (including masked) to final vq dim
         transformer_features = self.project_hid(outputs[0])
@@ -1788,10 +1837,7 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             attention_mask = self._get_feature_vector_attention_mask(
                 extract_features.shape[1], attention_mask, add_adapter=False
             )
-        # 3. compute consistency loss
-        consistency_loss = self.local_consistency_loss(outputs, high_cost_outputs, attention_mask)
 
-        # 4. quantize all (unmasked) extracted features and project to final vq dim
         quantized_features, codevector_perplexity = self.quantizer(
             extract_features, mask_time_indices=mask_time_indices
         )
@@ -1799,7 +1845,7 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
         quantized_features = quantized_features.to(self.project_q.weight.dtype)
         quantized_features = self.project_q(quantized_features)
 
-        loss = contrastive_loss = diversity_loss = None
+        loss = contrastive_loss = diversity_loss = consistency_loss = None
         if sampled_negative_indices is not None:
             batch_size, sequence_length, hidden_size = quantized_features.shape
 
@@ -1840,10 +1886,16 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             num_codevectors = self.config.num_codevectors_per_group * self.config.num_codevector_groups
             diversity_loss = ((num_codevectors - codevector_perplexity) / num_codevectors) * mask_time_indices.sum()
 
-            # 8. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d
+            # 8. compute consistency loss
+            if self.config.high_solver_type is not None:
+                consistency_loss = self.compute_consistency_loss(outputs, highcost_outputs, attention_mask)
+            else:
+                consistency_loss = 0
+
+            # 9. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d + \beta * \mathbf{L}_c
             loss = contrastive_loss \
                 + self.config.diversity_loss_weight * diversity_loss \
-                    + self.config.consistency_loss_weight * consistency_loss
+                + self.config.consistency_loss_weight * consistency_loss
 
         if not return_dict:
             if loss is not None:
@@ -1859,6 +1911,7 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             attentions=outputs.attentions,
             contrastive_loss=contrastive_loss,
             diversity_loss=diversity_loss,
+            consistency_loss=consistency_loss,
         )
 
 
