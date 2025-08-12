@@ -67,12 +67,12 @@ class TimeModule(nn.Module):
                               unshaped_weight: Tensor,
                               raw_scaling_factor: Tensor,
                               )-> Tuple[Tensor, Tensor]:
-        with autocast(enabled=False):
-            weight, bias = self.reshape_weight(unshaped_weight)
-            scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
+        # autocast?
+        weight, bias = self.reshape_weight(unshaped_weight)
+        scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
 
-            weight_ = self.weight + scaling_factor * weight / self.rank
-            bias_ = self.bias + scaling_factor * bias / self.rank
+        weight_ = self.weight + scaling_factor * weight / self.rank
+        bias_ = self.bias + scaling_factor * bias / self.rank
 
         return weight_, bias_
     
@@ -80,11 +80,11 @@ class TimeModule(nn.Module):
                                  unshaped_weight: Tensor,
                                  raw_scaling_factor: Tensor,
                                  )-> Tuple[Tensor, None]:
-        with autocast(enabled=False):
-            weight, _ = self.reshape_weight(unshaped_weight)
-            scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
+        # autocast?
+        weight, _ = self.reshape_weight(unshaped_weight)
+        scaling_factor = F.softplus(raw_scaling_factor + self.scale_init)
 
-            weight_ = self.weight + scaling_factor * weight / self.rank
+        weight_ = self.weight + scaling_factor * weight / self.rank
 
         return weight_, None
 

@@ -91,11 +91,9 @@ class WeightGenerator(nn.Module):
         Returns:
             weight (torch.Tensor): Time-dynamic unshaped weights for the target module.
         """
-
+        # autocast?
         mlp_out = self.mlp(sinusoidal_emb)
-        
-        with autocast(enabled=False):
-            unshaped_weight = self.projection_dir(mlp_out)
-            raw_scaling_factor = self.projection_scale(mlp_out)
+        unshaped_weight = self.projection_dir(mlp_out)
+        raw_scaling_factor = self.projection_scale(mlp_out)
 
         return unshaped_weight, raw_scaling_factor

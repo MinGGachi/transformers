@@ -687,7 +687,7 @@ class Wav2Vec2FeedForward(nn.Module):
         hidden_states = self.output_dropout(hidden_states)
         return hidden_states
 
-# TODO: Check buffer dtype
+
 class Wav2Vec2EncoderLayer(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
@@ -749,7 +749,7 @@ class Wav2Vec2EncoderLayer(nn.Module):
 
         return hidden_states
 
-# TODO: Check buffer dtype
+
 class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
     def __init__(self, config):
         # config must contain parameters for the time-varying modules
@@ -1890,12 +1890,16 @@ class TimeWav2Vec2ForPreTraining(TimeWav2Vec2PreTrainedModel):
             if self.config.high_solver_type is not None:
                 consistency_loss = self.compute_consistency_loss(outputs, highcost_outputs, attention_mask)
             else:
-                consistency_loss = 0
+                consistency_loss = torch.zeros_like(contrastive_loss).to(input_values.device)
 
             # 9. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d + \beta * \mathbf{L}_c
-            loss = contrastive_loss \
-                + self.config.diversity_loss_weight * diversity_loss \
-                + self.config.consistency_loss_weight * consistency_loss
+            if self.config.high_solver_type is not None:
+                loss = contrastive_loss \
+                    + self.config.diversity_loss_weight * diversity_loss \
+                    + self.config.consistency_loss_weight * consistency_loss
+            else:
+                loss = contrastive_loss \
+                    + self.config.diversity_loss_weight * diversity_loss
 
         if not return_dict:
             if loss is not None:
