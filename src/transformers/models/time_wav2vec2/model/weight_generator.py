@@ -76,8 +76,8 @@ class WeightGenerator(nn.Module):
                 * (module.in_channels // module.groups * math.prod(module.kernel_size) + module.out_channels) \
                 + int(bias) * module.out_channels
         elif isinstance(module, nn.LayerNorm):
-            # LayerNorm doesn't have bias and rank doesn't affect the dimension of weights and biases
-            return math.prod(module.normalized_shape)
+            # In LayerNorm, rank doesn't affect the dimension of weights and biases
+            return math.prod(module.normalized_shape) * (1 + int(bias))
 
     def forward(self,
                 sinusoidal_emb: Tensor,

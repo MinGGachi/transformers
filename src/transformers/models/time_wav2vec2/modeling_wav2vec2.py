@@ -64,6 +64,7 @@ from ..wav2vec2.modeling_wav2vec2 import Wav2Vec2Model
 
 # ode integrator
 from torchdiffeq import odeint_adjoint as odeint
+# from torchdiffeq import odeint
 # Time Varying torch.nn.Module
 from .model import SinusoidalEmbedding, WeightGenerator, Linear, LayerNorm
 
@@ -912,6 +913,7 @@ class Wav2Vec2Encoder(nn.Module):
         if attention_mask is not None:
             self.layer.set_mask(attention_mask)
         trajectory = odeint(self.layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
+        # trajectory = odeint(self.layer, hidden_states, time, method=solver_type)
         
         if output_hidden_states:
             all_hidden_states = all_hidden_states + tuple(trajectory[i] for i in range(0, len(trajectory)))
@@ -1002,6 +1004,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
         if attention_mask is not None:
             self.layer.set_mask(attention_mask)
         trajectory = odeint(self.layer, hidden_states, time, method=solver_type, adjoint_params=tuple(self.layer.parameters()))
+        # trajectory = odeint(self.layer, hidden_states, time, method=solver_type)
         
         if output_hidden_states:
             all_hidden_states = all_hidden_states + tuple(trajectory[i] for i in range(0, len(trajectory)))
@@ -1231,10 +1234,17 @@ class TimeWav2Vec2PreTrainedModel(PreTrainedModel):
             nn.init.uniform_(module.projection.weight, a=-k, b=k)
             nn.init.uniform_(module.projection.bias, a=-k, b=k)
         elif isinstance(module, WeightGenerator):
-            nn.init.zeros_(module.projection_dir.weight)
-            nn.init.zeros_(module.projection_dir.bias)
+            rank = self.config.rank
+            range_constant = math.sqrt(rank / 9)
+            c = math.sqrt(self.config.initializer_range / range_constant)
+
+            nn.init.uniform_(module.projection_dir.weight, a=-c, b=c)
+            nn.init.uniform_(module.projection_dir.bias, a=-c, b=c)
             nn.init.zeros_(module.projection_scale.weight)
             nn.init.zeros_(module.projection_scale.bias)
+        elif isinstance(module, LayerNorm):
+            nn.init.zeros_(module.weight_generator.projection_dir.weight)
+            nn.init.zeros_(module.weight_generator.projection_dir.bias)
         elif isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
 
