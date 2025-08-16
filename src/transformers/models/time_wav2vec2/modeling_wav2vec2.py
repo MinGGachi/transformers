@@ -739,7 +739,7 @@ class Wav2Vec2EncoderLayer(nn.Module):
         super().__init__()
 
         # to make Wav2Vec2EncoderLayer compatible with torchdiffeq,
-        # we need to register mask as abuffer
+        # we need to register mask as a buffer
         self.register_buffer('attention_mask', None, persistent=False)
         # to hook the attention weights
         self.output_attentions = False
@@ -801,7 +801,7 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         super().__init__()
 
         # to make Wav2Vec2EncoderLayerStableLayerNorm compatible with torchdiffeq, 
-        # we need to register mask as abuffer
+        # we need to register mask as a buffer
         self.register_buffer('attention_mask', None, persistent=False)
         # to hook the attention weights
         self.output_attentions = False
@@ -2877,6 +2877,7 @@ __all__ = [
     "TimeWav2Vec2ForAudioFrameClassification",
     "TimeWav2Vec2ForCTC",
     "TimeWav2Vec2ForMaskedLM",
+    "TimeWav2Vec2ForDistillation",
     "TimeWav2Vec2ForPreTraining",
     "TimeWav2Vec2ForSequenceClassification",
     "TimeWav2Vec2ForXVector",
