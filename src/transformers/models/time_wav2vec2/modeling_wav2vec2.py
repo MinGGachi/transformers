@@ -1013,6 +1013,7 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             all_self_attentions = tuple(self.layer.attn_weights.items())
 
         hidden_states = trajectory[-1]
+        hidden_states = self.layer_norm(hidden_states)
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
