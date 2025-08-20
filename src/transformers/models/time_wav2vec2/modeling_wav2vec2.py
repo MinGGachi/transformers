@@ -589,22 +589,22 @@ class Wav2Vec2Attention(nn.Module):
 
         # activation function for the weight generator
         if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
+            time_activation = ACT2FN[config.time_activation]
         else:
-            self.time_activation = config.time_activation
+            time_activation = config.time_activation
 
         self.q_proj = Linear(embed_dim, embed_dim, bias=bias,
                              rank=config.rank, time_dim=config.time_dim,
-                             hidden_dim=config.hidden_dim, activation=self.time_activation)
+                             hidden_dim=config.hidden_dim, activation=time_activation)
         self.k_proj = Linear(embed_dim, embed_dim, bias=bias,
                              rank=config.rank, time_dim=config.time_dim,
-                             hidden_dim=config.hidden_dim, activation=self.time_activation)
+                             hidden_dim=config.hidden_dim, activation=time_activation)
         self.v_proj = Linear(embed_dim, embed_dim, bias=bias,
                              rank=config.rank, time_dim=config.time_dim,
-                             hidden_dim=config.hidden_dim, activation=self.time_activation)
+                             hidden_dim=config.hidden_dim, activation=time_activation)
         self.out_proj = Linear(embed_dim, embed_dim, bias=bias,
                                rank=config.rank, time_dim=config.time_dim,
-                               hidden_dim=config.hidden_dim, activation=self.time_activation)
+                               hidden_dim=config.hidden_dim, activation=time_activation)
 
     def forward(
         self,
@@ -701,15 +701,15 @@ class Wav2Vec2FeedForward(nn.Module):
         super().__init__()
         # activation function for the time-varying modules
         if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
+            time_activation = ACT2FN[config.time_activation]
         else:
-            self.time_activation = config.time_activation
+            time_activation = config.time_activation
         
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
 
         self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
                                          rank=config.rank, time_dim=config.time_dim,
-                                         hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                         hidden_dim=config.hidden_dim, activation=time_activation)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -717,7 +717,7 @@ class Wav2Vec2FeedForward(nn.Module):
 
         self.output_dense = Linear(config.intermediate_size, config.hidden_size,
                                    rank=config.rank, time_dim=config.time_dim,
-                                   hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                   hidden_dim=config.hidden_dim, activation=time_activation)
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, 
@@ -748,9 +748,9 @@ class Wav2Vec2EncoderLayer(nn.Module):
         # for time-varying modules
         self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
         if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
+            time_activation = ACT2FN[config.time_activation]
         else:
-            self.time_activation = config.time_activation
+            time_activation = config.time_activation
 
         self.attention = Wav2Vec2Attention(
             embed_dim=config.hidden_size,
@@ -762,11 +762,11 @@ class Wav2Vec2EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                     rank=config.rank, time_dim=config.time_dim,
-                                    hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                    hidden_dim=config.hidden_dim, activation=time_activation)
         self.feed_forward = Wav2Vec2FeedForward(config)
         self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                           rank=config.rank, time_dim=config.time_dim,
-                                          hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                          hidden_dim=config.hidden_dim, activation=time_activation)
 
     def set_mask(self, mask: Optional[torch.Tensor] = None):
         self.attention_mask = mask
@@ -810,9 +810,9 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         # for time-varying modules
         self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
         if isinstance(config.time_activation, str):
-            self.time_activation = ACT2FN[config.time_activation]
+            time_activation = ACT2FN[config.time_activation]
         else:
-            self.time_activation = config.time_activation
+            time_activation = config.time_activation
 
         self.attention = Wav2Vec2Attention(
             embed_dim=config.hidden_size,
@@ -824,11 +824,11 @@ class Wav2Vec2EncoderLayerStableLayerNorm(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout)
         self.layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                     rank=config.rank, time_dim=config.time_dim,
-                                    hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                    hidden_dim=config.hidden_dim, activation=time_activation)
         self.feed_forward = Wav2Vec2FeedForward(config)
         self.final_layer_norm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
                                           rank=config.rank, time_dim=config.time_dim,
-                                          hidden_dim=config.hidden_dim, activation=self.time_activation)
+                                          hidden_dim=config.hidden_dim, activation=time_activation)
 
         if getattr(config, "adapter_attn_dim", None) is not None:
             self.adapter_layer = Wav2Vec2AttnAdapterLayer(config)
@@ -1998,6 +1998,20 @@ class TimeWav2Vec2ForDistillation(TimeWav2Vec2PreTrainedModel):
         self.teacher_model.requires_grad_(False)
         self.teacher_model.config.output_hidden_states = True
 
+        with torch.no_grad():
+            self.wav2vec2.feature_extractor.load_state_dict(self.teacher_model.feature_extractor.state_dict())
+            self.wav2vec2.feature_projection.load_state_dict(self.teacher_model.feature_projection.state_dict())
+            load_result = self.wav2vec2.encoder.layer.load_state_dict(self.teacher_model.encoder.layers[0].state_dict(), strict=False)
+        print("--------------------------------")
+        print("missing key list:")
+        for missing_key in load_result.missing_keys:
+            if "weight_generator" not in missing_key and "sinusoidal_emb" not in missing_key:
+                print(missing_key)
+        print("--------------------------------")
+        print("unexpected key list:")
+        for unexpected_key in load_result.unexpected_keys:
+            print(unexpected_key)
+
     def set_gumbel_temperature(self, temperature: int):
         """
         Set the Gumbel softmax temperature to a given value. Only necessary for training
@@ -2045,21 +2059,26 @@ class TimeWav2Vec2ForDistillation(TimeWav2Vec2PreTrainedModel):
         return logits
 
     @staticmethod
-    def compute_flow_matching_loss(v_hat, teacher_features, t, attention_mask=None):
+    def compute_flow_matching_loss(outputs, teacher_outputs, time, attention_mask=None):
+        v_hat = outputs.hidden
         loss = nn.MSELoss()
-        L = len(teacher_features) - 1
-        l = min(math.floor(t * L), L - 1)
+        for t in time:
+            L = len(teacher_features) - 1
+            l = min(math.floor(t * L), L - 1)
+            v_t = (teacher_features[l + 1] - teacher_features[l]) / L
 
-        v_t = (teacher_features[l + 1] - teacher_features[l]) / L
+            loss += loss(v_hat, v_t)
 
-        return loss(v_hat, v_t)
+        return loss
 
     @auto_docstring
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        input_values_teacher: Optional[torch.Tensor],
         time: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        attention_mask_teacher: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.BoolTensor] = None,
         sampled_negative_indices: Optional[torch.BoolTensor] = None,
         output_attentions: Optional[bool] = None,
@@ -2139,12 +2158,11 @@ class TimeWav2Vec2ForDistillation(TimeWav2Vec2PreTrainedModel):
 
         with torch.no_grad():
             teacher_outputs = self.teacher_model(
-                input_values,
-                attention_mask=attention_mask,
+                input_values_teacher,
+                attention_mask=attention_mask_teacher,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
-            teacher_outputs = teacher_outputs.hidden_states
 
         # 1. project all transformed features (including masked) to final vq dim
         transformer_features = self.project_hid(outputs[0])
@@ -2207,7 +2225,7 @@ class TimeWav2Vec2ForDistillation(TimeWav2Vec2PreTrainedModel):
             diversity_loss = ((num_codevectors - codevector_perplexity) / num_codevectors) * mask_time_indices.sum()
 
             # 8. compute flow matching loss
-            flow_matching_loss = self.compute_flow_matching_loss(outputs, teacher_outputs, attention_mask)
+            flow_matching_loss = self.compute_flow_matching_loss(outputs, teacher_outputs, time, attention_mask)
 
             # 9. \mathbf{L} = \mathbf{L}_m + \alpha * \mathbf{L}_d + \beta * \mathbf{L}_c
             loss = contrastive_loss \
