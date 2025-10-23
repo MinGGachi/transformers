@@ -68,7 +68,10 @@ def sdpa_attention_forward(
         key,
         value,
         attn_mask=attention_mask,
-        dropout_p=dropout,
+        # This is for backward compatibility. It seems error in implementation.
+        # Min Jun Choi, 25.09.25
+        # dropout_p=dropout, 
+        dropout_p=(dropout if module.training else 0.0),
         scale=scaling,
         is_causal=is_causal,
     )
