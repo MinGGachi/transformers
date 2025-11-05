@@ -16,7 +16,7 @@
 ####
 # written by Min Jun Choi
 # Ph.D. Student, Music & Audio Research Group, Seoul Nat'l Univ.
-# Last modified: 25.09.25
+# Last modified: 25.10.26
 ####
 """PyTorch WavNode model."""
 import math
@@ -31,21 +31,17 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
-from ...integrations.deepspeed import is_deepspeed_zero3_enabled
 from ...modeling_attn_mask_utils import (
     _prepare_4d_attention_mask,
     _prepare_4d_attention_mask_for_sdpa,
 )
-from ...integrations.fsdp import is_fsdp_managed_module
 from ...modeling_outputs import (
     BaseModelOutput,
     CausalLMOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
-    Wav2Vec2BaseModelOutput,
     XVectorOutput,
 )
-WavNodeBaseModelOutput = Wav2Vec2BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...utils import (
     ModelOutput, 
@@ -61,22 +57,27 @@ from .model import *
 
 logger = logging.get_logger(__name__)
 
+class GradMultiply(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        res = x.new(x)
+        return res
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
 
 @dataclass
-class WavNodeForPretrainingOutput(ModelOutput):
+class WavNodeBaseModelOutput(ModelOutput):
     """
-    Output type of [`Wav2Vec2ForPreTraining`], with potential hidden states and attentions.
+    Base class for models that have been trained with the Wav2Vec2 loss objective.
 
     Args:
-        loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
-            Total loss as the sum of the contrastive loss (L_m) and the diversity loss (L_d) as stated in the [official
-            paper](https://arxiv.org/pdf/2006.11477.pdf) . (classification) loss.
-        projected_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.proj_codevector_dim)`):
-            Hidden-states of the model projected to *config.proj_codevector_dim* that can be used to predict the masked
-            projected quantized states.
-        projected_quantized_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.proj_codevector_dim)`):
-            Quantized extracted feature vectors projected to *config.proj_codevector_dim* representing the positive
-            target vectors for contrastive loss.
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        extract_features (`torch.FloatTensor` of shape `(batch_size, sequence_length, conv_dim[-1])`):
+            Sequence of extracted feature vectors of the last convolutional layer of the model.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
             shape `(batch_size, sequence_length, hidden_size)`.
@@ -88,17 +89,47 @@ class WavNodeForPretrainingOutput(ModelOutput):
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        contrastive_loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
-            The contrastive loss (L_m) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
-        diversity_loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
-            The diversity loss (L_d) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    extract_features: Optional[torch.FloatTensor] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attention_mask: Optional[torch.FloatTensor] = None
+
+@dataclass
+class WavNodeForPretrainingOutput(ModelOutput):
+    """
+    Output type of [`Wav2Vec2ForPreTraining`], with potential hidden states and attentions.
+
+    Args:
+        loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
+            Total loss as the sum of the contrastive loss (L_m) and the diversity loss (L_d) as stated in the [official
+            paper](https://arxiv.org/pdf/2006.11477.pdf) . (classification) loss.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
+            shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        nce_loss (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
+            The NCE loss (L_m) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+        stiffness_loss (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
+            The stiffness loss (L_s) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+        features_penalty (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
+            The features penalty (L_p) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
     """
     loss: Optional[torch.FloatTensor] = None
-    projected_states: Optional[torch.FloatTensor] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     nce_loss: Optional[torch.FloatTensor] = None
     stiffness_loss: Optional[torch.FloatTensor] = None
+    features_penalty: Optional[torch.FloatTensor] = None
 
 
 def _compute_mask_indices(
@@ -246,21 +277,7 @@ class WavNodePositionalConvEmbedding(nn.Module):
         if hasattr(nn.utils.parametrizations, "weight_norm"):
             weight_norm = nn.utils.parametrizations.weight_norm
 
-        if is_deepspeed_zero3_enabled():
-            import deepspeed
-
-            with deepspeed.zero.GatheredParameters(self.conv.weight, modifier_rank=0):
-                self.conv = weight_norm(self.conv, name="weight", dim=2)
-            if hasattr(self.conv, "parametrizations"):
-                weight_g = self.conv.parametrizations.weight.original0
-                weight_v = self.conv.parametrizations.weight.original1
-            else:
-                weight_g = self.conv.weight_g
-                weight_v = self.conv.weight_v
-            deepspeed.zero.register_external_parameter(self, weight_v)
-            deepspeed.zero.register_external_parameter(self, weight_g)
-        else:
-            self.conv = weight_norm(self.conv, name="weight", dim=2)
+        self.conv = weight_norm(self.conv, name="weight", dim=2)
 
         self.padding = WavNodeSamePadLayer(config.num_conv_pos_embeddings)
         self.activation = ACT2FN[config.feat_extract_activation]
@@ -285,10 +302,10 @@ class WavNodeFeatureProjection(nn.Module):
 
     def forward(self, hidden_states):
         # non-projected hidden states are needed for quantization
-        norm_hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.projection(norm_hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states, norm_hidden_states
+        projected_hidden_states = self.layer_norm(hidden_states)
+        projected_hidden_states = self.projection(projected_hidden_states)
+        projected_hidden_states = self.dropout(projected_hidden_states)
+        return projected_hidden_states, hidden_states
 
 
 def eager_attention_forward(
@@ -418,6 +435,26 @@ class WavNodeFeatureEncoder(nn.Module):
             param.requires_grad = False
         self._requires_grad = False
 
+    @staticmethod
+    def _align_features_and_labels(
+        hidden_states: torch.FloatTensor,
+        labels: torch.FloatTensor,
+        feat2tar_ratio: float,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        # Trim features to ensure labels exist and then get aligned labels
+        # This method is used for ONLY pretraining stage
+        T_hidden = hidden_states.size(2)
+        T_labels = labels.size(1)
+
+        if feat2tar_ratio * T_hidden > T_labels:
+            T_hidden = int(T_labels / feat2tar_ratio)
+            hidden_states = hidden_states[:, :, :T_hidden]
+
+        target_inds = torch.arange(T_hidden).float() * feat2tar_ratio
+        labels = labels[:, target_inds.long()]
+        
+        return hidden_states, labels
+
     def forward(self, input_values):
         hidden_states = input_values[:, None]
 
@@ -435,7 +472,6 @@ class WavNodeFeatureEncoder(nn.Module):
                 hidden_states = conv_layer(hidden_states)
                 
         return hidden_states
-
 
 
 class WavNodeAttention(nn.Module):
@@ -851,6 +887,10 @@ class WavNodeModel(WavNodePreTrainedModel):
         self.config = config
         self.feature_encoder = WavNodeFeatureEncoder(config)
         self.feature_projection = WavNodeFeatureProjection(config)
+        self.feature_grad_mult = config.feature_grad_mult
+        
+        downsampling_rate = np.prod(config.conv_stride)
+        self.feat2label_ratio = config.label_rate * downsampling_rate / config.sample_rate
 
         # model only needs masking vector if mask prob is > 0.0
         if config.mask_time_prob > 0.0 or config.mask_feature_prob > 0.0:
@@ -918,6 +958,8 @@ class WavNodeModel(WavNodePreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        times: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
@@ -935,7 +977,19 @@ class WavNodeModel(WavNodePreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        extract_features = self.feature_encoder(input_values)
+        if self.feature_grad_mult > 0:
+            extract_features = self.feature_encoder(input_values)
+            if self.feature_grad_mult != 1.0:
+                extract_features = GradMultiply.apply(extract_features, self.feature_grad_mult)
+        else:
+            with torch.no_grad():
+                extract_features = self.feature_encoder(input_values)
+
+        if labels is not None:
+            extract_features, labels = self.feature_encoder._align_features_and_labels(
+                extract_features, labels, self.feat2label_ratio
+            )
+
         extract_features = extract_features.transpose(1, 2)
 
         if attention_mask is not None:
@@ -951,6 +1005,7 @@ class WavNodeModel(WavNodePreTrainedModel):
 
         encoder_outputs = self.encoder(
             hidden_states,
+            times=times,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -960,11 +1015,12 @@ class WavNodeModel(WavNodePreTrainedModel):
         hidden_states = encoder_outputs[0]
 
         if not return_dict:
-            return (hidden_states, extract_features) + encoder_outputs[1:]
+            return (hidden_states, extract_features, attention_mask) + encoder_outputs[1:]
 
         return WavNodeBaseModelOutput(
             last_hidden_state=hidden_states,
             extract_features=extract_features,
+            attention_mask=attention_mask,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
@@ -978,23 +1034,29 @@ class WavNodeModel(WavNodePreTrainedModel):
 class WavNodeForPreTraining(WavNodePreTrainedModel):
     def __init__(self, config: WavNodeConfig):
         super().__init__(config)
+        self.config = config
+
         # wavnode model
         self.wavnode = WavNodeModel(config)
 
         # for pretraining head
-        self.final_proj = nn.Linear(config.hidden_size, config.codevector_dim)
-        self.label_embs = nn.Parameter(torch.FloatTensor(config.num_classes, config.codevector_dim))
-        nn.init.uniform_(self.label_embs)
-
         if getattr(config, "use_target_glu", False):
             self.target_glu = nn.Sequential(
                 nn.Linear(config.codevector_dim, 2 * config.codevector_dim),
-                nn.GLU(dim=-1),
+                nn.GLU(),
             )
+        else:
+            self.target_glu = None
+        
+        self.final_proj = nn.Linear(config.hidden_size, config.codevector_dim)
+        self.label_embs = nn.Parameter(torch.FloatTensor(config.num_classes, config.codevector_dim))
+        self.num_classes = config.num_classes
+        nn.init.uniform_(self.label_embs)
 
-        feature_ds_rate = np.prod(config.conv_stride)
-        self.feat2tar_ratio = config.label_rate * feature_ds_rate / config.sample_rate
         self.logits_temperature = config.logits_temperature
+        self.loss_fn = CrossEntropyLoss(ignore_index=-100, 
+                                        reduction=config.nce_loss_reduction, 
+                                        label_smoothing=config.label_smoothing)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1018,152 +1080,93 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
         """
         self.wavnode.feature_encoder._freeze_parameters()
 
-    def _compute_pred(self, proj_x: torch.Tensor, label_embs: torch.Tensor) -> torch.Tensor:
-        """
-        Compute class logits for HuBERT-style masked prediction.
-
-        Args:
-            proj_x: Tensor of shape (N_mask, D)
-            label_embs: Tensor of shape (K, D)
-        Returns:
-            logits: Tensor of shape (N_mask, K)
-        """
-        if getattr(self.config, "use_target_glu", False):
-            label_embs = self.target_glu(label_embs)
-
-        if getattr(self.config, "use_cosine_similarity", True):
-            proj_x = F.normalize(proj_x, dim=-1)
-            label_embs = F.normalize(label_embs, dim=-1)
-            logits = torch.matmul(proj_x, label_embs.transpose(0, 1))
-        else:
-            logits = torch.matmul(proj_x, label_embs.transpose(0, 1))
-
-        logits = logits / self.logits_temperature
-        return logits
-
-    def _forward_targets(
+    def _compute_nce(
         self,
-        features: torch.Tensor,
-        target_list: List[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Trim features to ensure labels exist and then get aligned labels
-        feat_tsz = features.size(2)
-        targ_tsz = min([t.size(1) for t in target_list])
-        if self.feat2tar_ratio * feat_tsz > targ_tsz:
-            feat_tsz = int(targ_tsz / self.feat2tar_ratio)
-            features = features[..., :feat_tsz]
-        target_inds = torch.arange(feat_tsz, device=features.device).float() * self.feat2tar_ratio
-        target_list = [t[:, target_inds.long()] for t in target_list]
-        return features, target_list
+        hidden_states: torch.FloatTensor,
+        positive_state: torch.FloatTensor,
+        negative_states: torch.FloatTensor,
+        ) -> torch.FloatTensor:
+
+        pos_is_in_negs = (positive_state == negative_states).all(-1)
+        positive_state = positive_state.unsqueeze(0)
+        labels = torch.cat([positive_state, negative_states], dim=0) # (1+C, S, D)
+
+        logits = torch.cosine_similarity(hidden_states.float().unsqueeze(0), labels.float(), dim=-1) # (1+C, S)
+        logits /= self.logits_temperature
+
+        if pos_is_in_negs.any():
+            logits[1:][pos_is_in_negs] = float("-inf")
+
+        return logits.transpose(0, 1)
 
     def forward(
         self,
         input_values: Optional[torch.Tensor],
+        times: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.BoolTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, WavNodeForPretrainingOutput]:
-        
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        batch_size, raw_sequence_length = input_values.shape
-
-        # Prepare feature-domain mask if not provided
-        if mask_time_indices is None and self.training and self.config.mask_time_prob > 0:
-            input_lengths = (
-                attention_mask.sum(-1)
-                if attention_mask is not None
-                else torch.full((batch_size,), raw_sequence_length, device=input_values.device, dtype=torch.long)
-            )
-            feat_lengths = self.wavnode._get_feat_extract_output_lengths(input_lengths)
-            max_feat_len = int(feat_lengths.max().item())
-            feat_attn_mask = None
-            if attention_mask is not None:
-                feat_attn_mask = self.wavnode._get_feature_vector_attention_mask(max_feat_len, attention_mask)
-            mask_np = _compute_mask_indices(
-                (batch_size, max_feat_len),
-                mask_prob=self.config.mask_time_prob,
-                mask_length=self.config.mask_time_length,
-                attention_mask=feat_attn_mask,
-                min_masks=self.config.mask_time_min_masks,
-            )
-            mask_time_indices = torch.tensor(mask_np, device=input_values.device, dtype=torch.bool)
-        elif mask_time_indices is not None:
+        if mask_time_indices is not None:
             mask_time_indices = mask_time_indices.to(torch.bool)
 
-        # Forward backbone with mask indices
         outputs = self.wavnode(
-            input_values,
+            input_values=input_values,
+            times=times,
+            labels=labels,
             attention_mask=attention_mask,
             mask_time_indices=mask_time_indices,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        features_penalty = outputs.extract_features.float().pow(2).mean()
 
-        hidden_states = outputs[0]  # (B, T_feat, H)
-        attentions = outputs.attentions if return_dict else None
+        hidden_states = outputs.last_hidden_state
 
-        # Build feature padding mask
-        if attention_mask is not None:
-            padding_mask = self.wavnode._get_feature_vector_attention_mask(hidden_states.shape[1], attention_mask)
-        else:
-            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool)
+        def _compute_pred(proj_x, target, label_embs):
+            # compute logits for the i-th label set
+            y = torch.index_select(label_embs, 0, target.long())
+            negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
+            if self.target_glu:
+                y = self.target_glu(y)
+                negs = self.target_glu(negs)
+            # proj_x: (S, D)
+            # y: (S, D)
+            # negs: (Neg, S, D)
+            return self._compute_nce(proj_x, y, negs)
 
-        # Align labels to feature frames if provided
-        aligned_labels = None
-        if labels is not None:
-            features_nc_t, [aligned_labels] = self._forward_targets(hidden_states.transpose(1, 2), [labels])
-            new_len = features_nc_t.size(2)
-            if hidden_states.size(1) != new_len:
-                hidden_states = hidden_states[:, :new_len]
-                padding_mask = padding_mask[:, :new_len]
-                if mask_time_indices is not None:
-                    mask_time_indices = mask_time_indices[:, :new_len]
+        masked_indices = torch.logical_and(outputs.attention_mask, mask_time_indices)
+        masked_states = self.final_proj(hidden_states[masked_indices])
+        masked_logits = _compute_pred(masked_states, labels[masked_indices], self.label_embs)
 
-        # Determine masked positions
-        masked_indices = None
-        if mask_time_indices is not None:
-            masked_indices = mask_time_indices & padding_mask
-        else:
-            # if no mask provided and skip_nomask is True, do not compute loss
-            masked_indices = padding_mask if not getattr(self.config, "skip_nomask", True) else None
+        loss = 0.0
 
-        # Project and compute logits/loss
-        projected_states = self.final_proj(hidden_states)
-
-        loss = None
-        if aligned_labels is not None:
-            # if there are masked indices, compute the loss
-            if masked_indices is not None and masked_indices.any():
-                proj_x_m = projected_states[masked_indices]
-                logits_m = self._compute_pred(proj_x_m, self.label_embs)
-
-                targets_m = aligned_labels[masked_indices]
-                loss = F.cross_entropy(logits_m, targets_m.long())
-            else:
-                # no masked indices, set loss to 0
-                loss = torch.tensor(0.0, device=projected_states.device, dtype=projected_states.dtype)
-
-        if not return_dict:
-            return (loss, projected_states) + outputs[2:]
+        if masked_logits is not None:
+            masked_logits = masked_logits.float()
+            targ_m = torch.zeros(masked_logits.shape[0], dtype=torch.long, device=masked_logits.device)
+            nce_loss = self.loss_fn(masked_logits, targ_m)
+            
+            loss += nce_loss + self.config.features_penalty_weight * features_penalty
 
         return WavNodeForPretrainingOutput(
             loss=loss,
-            projected_states=projected_states,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            nce_loss=None,
+            nce_loss=nce_loss,
             stiffness_loss=None,
+            features_penalty=features_penalty,
         )
 
 
 __all__ = [
-    "WavNodeEncoderLayer",
-    "WavNodeEncoder",
     "WavNodeModel",
-    "WavNodePreTrainedModel"
+    "WavNodePreTrainedModel",
+    "WavNodeForPreTraining",
 ]

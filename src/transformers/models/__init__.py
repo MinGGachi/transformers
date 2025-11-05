@@ -293,8 +293,6 @@ if TYPE_CHECKING:
     from .timesfm import *
     from .timesformer import *
     #### time varying transformer ####
-    from .time_hubert import *
-    #### time_hubert ####
     from .time_wav2vec2 import *
     #### time_wav2vec2 ####
     from .timm_backbone import *
@@ -329,6 +327,7 @@ if TYPE_CHECKING:
     from .wav2vec2_phoneme import *
     from .wav2vec2_with_lm import *
     from .wavlm import *
+    from .wavnode import *
     from .whisper import *
     from .x_clip import *
     from .xglm import *

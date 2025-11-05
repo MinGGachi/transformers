@@ -133,11 +133,9 @@ class WavNodeConfig(PretrainedConfig):
         num_negatives (`int`, *optional*, defaults to 100):
             Number of negative samples for the contrastive loss.
         codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the quantized feature vectors.
+            Dimensionality of the codevectors.
         proj_codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the final projection of both the quantized and the transformer features.
-        diversity_loss_weight (`int`, *optional*, defaults to 0.1):
-            The weight of the codebook diversity loss component.
+            Dimensionality of the final projection of the codevectors.
         ctc_loss_reduction (`str`, *optional*, defaults to `"mean"`):
             Specifies the reduction to apply to the output of `torch.nn.CTCLoss`. Only relevant when training an
             instance of [`WavLMForCTC`].
@@ -203,6 +201,7 @@ class WavNodeConfig(PretrainedConfig):
         feat_proj_dropout=0.0,
         final_dropout=0.1,
         initializer_range=0.02,
+        feature_grad_mult=0.1,
         layer_norm_eps=1e-5,
         feat_extract_norm="group",
         feat_extract_activation="gelu",
@@ -226,6 +225,9 @@ class WavNodeConfig(PretrainedConfig):
         use_target_glu=False,
         use_cosine_similarity=True,
         skip_nomask=True,
+        nce_loss_reduction="sum",
+        label_smoothing=0.0,
+        features_penalty_weight=10.0,
         ctc_loss_reduction="mean",
         ctc_zero_infinity=False,
         use_weighted_layer_sum=False,
@@ -299,6 +301,14 @@ class WavNodeConfig(PretrainedConfig):
         self.use_target_glu = use_target_glu
         self.use_cosine_similarity = use_cosine_similarity
         self.skip_nomask = skip_nomask
+        self.label_rate = label_rate
+        self.sample_rate = sample_rate
+        self.feature_grad_mult = feature_grad_mult
+
+        # NCE loss
+        self.nce_loss_reduction = nce_loss_reduction
+        self.label_smoothing = label_smoothing
+        self.features_penalty_weight = features_penalty_weight
 
         # ctc loss
         self.ctc_loss_reduction = ctc_loss_reduction
