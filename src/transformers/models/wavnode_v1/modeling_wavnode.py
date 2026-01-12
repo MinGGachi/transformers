@@ -16,7 +16,7 @@
 ####
 # written by Min Jun Choi
 # Ph.D. Student, Music & Audio Research Group, Seoul Nat'l Univ.
-# Last modified: 25.10.26
+# Last modified: 25.09.25
 ####
 """PyTorch WavNode model."""
 import math
@@ -31,17 +31,21 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
+from ...integrations.deepspeed import is_deepspeed_zero3_enabled
 from ...modeling_attn_mask_utils import (
     _prepare_4d_attention_mask,
     _prepare_4d_attention_mask_for_sdpa,
 )
+from ...integrations.fsdp import is_fsdp_managed_module
 from ...modeling_outputs import (
     BaseModelOutput,
     CausalLMOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
+    Wav2Vec2BaseModelOutput,
     XVectorOutput,
 )
+WavNodeBaseModelOutput = Wav2Vec2BaseModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...utils import (
     ModelOutput, 
@@ -57,45 +61,6 @@ from .model import *
 
 logger = logging.get_logger(__name__)
 
-class GradMultiply(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scale):
-        ctx.scale = scale
-        res = x.new(x)
-        return res
-
-    @staticmethod
-    def backward(ctx, grad):
-        return grad * ctx.scale, None
-
-@dataclass
-class WavNodeBaseModelOutput(ModelOutput):
-    """
-    Base class for models that have been trained with the Wav2Vec2 loss objective.
-
-    Args:
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        extract_features (`torch.FloatTensor` of shape `(batch_size, sequence_length, conv_dim[-1])`):
-            Sequence of extracted feature vectors of the last convolutional layer of the model.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
-            shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-    """
-
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    extract_features: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attention_mask: Optional[torch.FloatTensor] = None
 
 @dataclass
 class WavNodeForPretrainingOutput(ModelOutput):
@@ -106,6 +71,12 @@ class WavNodeForPretrainingOutput(ModelOutput):
         loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
             Total loss as the sum of the contrastive loss (L_m) and the diversity loss (L_d) as stated in the [official
             paper](https://arxiv.org/pdf/2006.11477.pdf) . (classification) loss.
+        projected_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.proj_codevector_dim)`):
+            Hidden-states of the model projected to *config.proj_codevector_dim* that can be used to predict the masked
+            projected quantized states.
+        projected_quantized_states (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.proj_codevector_dim)`):
+            Quantized extracted feature vectors projected to *config.proj_codevector_dim* representing the positive
+            target vectors for contrastive loss.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
             shape `(batch_size, sequence_length, hidden_size)`.
@@ -117,19 +88,17 @@ class WavNodeForPretrainingOutput(ModelOutput):
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        nce_loss (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
-            The NCE loss (L_m) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
-        stiffness_loss (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
-            The stiffness loss (L_s) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
-        features_penalty (*optional*, returned when `labels` are passed, `torch.FloatTensor` of shape `(1,)`):
-            The features penalty (L_p) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+        contrastive_loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
+            The contrastive loss (L_m) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
+        diversity_loss (*optional*, returned when `sample_negative_indices` are passed, `torch.FloatTensor` of shape `(1,)`):
+            The diversity loss (L_d) as stated in the [official paper](https://arxiv.org/pdf/2006.11477.pdf) .
     """
     loss: Optional[torch.FloatTensor] = None
+    projected_states: Optional[torch.FloatTensor] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     nce_loss: Optional[torch.FloatTensor] = None
     stiffness_loss: Optional[torch.FloatTensor] = None
-    features_penalty: Optional[torch.FloatTensor] = None
 
 
 def _compute_mask_indices(
@@ -273,37 +242,32 @@ class WavNodePositionalConvEmbedding(nn.Module):
             groups=config.num_conv_pos_embedding_groups,
         )
 
-        self.batch_norm = None
-        if config.conv_pos_batch_norm:
-            self.batch_norm = nn.BatchNorm1d(config.hidden_size)
-        else:
-            weight_norm = nn.utils.weight_norm
-            if hasattr(nn.utils.parametrizations, "weight_norm"):
-                weight_norm = nn.utils.parametrizations.weight_norm
+        weight_norm = nn.utils.weight_norm
+        if hasattr(nn.utils.parametrizations, "weight_norm"):
+            weight_norm = nn.utils.parametrizations.weight_norm
 
-            if is_deepspeed_zero3_enabled():
-                import deepspeed
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
 
-                with deepspeed.zero.GatheredParameters(self.conv.weight, modifier_rank=0):
-                    self.conv = weight_norm(self.conv, name="weight", dim=2)
-                if hasattr(self.conv, "parametrizations"):
-                    weight_g = self.conv.parametrizations.weight.original0
-                    weight_v = self.conv.parametrizations.weight.original1
-                else:
-                    weight_g = self.conv.weight_g
-                    weight_v = self.conv.weight_v
-                deepspeed.zero.register_external_parameter(self, weight_v)
-                deepspeed.zero.register_external_parameter(self, weight_g)
-            else:
+            with deepspeed.zero.GatheredParameters(self.conv.weight, modifier_rank=0):
                 self.conv = weight_norm(self.conv, name="weight", dim=2)
+            if hasattr(self.conv, "parametrizations"):
+                weight_g = self.conv.parametrizations.weight.original0
+                weight_v = self.conv.parametrizations.weight.original1
+            else:
+                weight_g = self.conv.weight_g
+                weight_v = self.conv.weight_v
+            deepspeed.zero.register_external_parameter(self, weight_v)
+            deepspeed.zero.register_external_parameter(self, weight_g)
+        else:
+            self.conv = weight_norm(self.conv, name="weight", dim=2)
 
         self.padding = WavNodeSamePadLayer(config.num_conv_pos_embeddings)
         self.activation = ACT2FN[config.feat_extract_activation]
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.transpose(1, 2)
-        if self.batch_norm is not None:
-            hidden_states = self.batch_norm(hidden_states)
+
         hidden_states = self.conv(hidden_states)
         hidden_states = self.padding(hidden_states)
         hidden_states = self.activation(hidden_states)
@@ -315,18 +279,16 @@ class WavNodePositionalConvEmbedding(nn.Module):
 class WavNodeFeatureProjection(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.feat_proj_layer_norm = config.feat_proj_layer_norm
-        if self.feat_proj_layer_norm:
-            self.layer_norm = nn.LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
         self.projection = nn.Linear(config.conv_dim[-1], config.hidden_size)
         self.dropout = nn.Dropout(config.feat_proj_dropout)
 
     def forward(self, hidden_states):
         # non-projected hidden states are needed for quantization
-        projected_hidden_states = self.layer_norm(hidden_states)
-        projected_hidden_states = self.projection(projected_hidden_states)
-        projected_hidden_states = self.dropout(projected_hidden_states)
-        return projected_hidden_states, hidden_states
+        norm_hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.projection(norm_hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        return hidden_states, norm_hidden_states
 
 
 def eager_attention_forward(
@@ -456,26 +418,6 @@ class WavNodeFeatureEncoder(nn.Module):
             param.requires_grad = False
         self._requires_grad = False
 
-    @staticmethod
-    def _align_features_and_labels(
-        hidden_states: torch.FloatTensor,
-        labels: torch.FloatTensor,
-        feat2tar_ratio: float,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        # Trim features to ensure labels exist and then get aligned labels
-        # This method is used for ONLY pretraining stage
-        T_hidden = hidden_states.size(2)
-        T_labels = labels.size(1)
-
-        if feat2tar_ratio * T_hidden > T_labels:
-            T_hidden = int(T_labels / feat2tar_ratio)
-            hidden_states = hidden_states[:, :, :T_hidden]
-
-        target_inds = torch.arange(T_hidden).float() * feat2tar_ratio
-        labels = labels[:, target_inds.long()]
-        
-        return hidden_states, labels
-
     def forward(self, input_values):
         hidden_states = input_values[:, None]
 
@@ -491,8 +433,9 @@ class WavNodeFeatureEncoder(nn.Module):
                 )
             else:
                 hidden_states = conv_layer(hidden_states)
-
+                
         return hidden_states
+
 
 
 class WavNodeAttention(nn.Module):
@@ -501,153 +444,21 @@ class WavNodeAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        bias: bool = True,
         dropout: float = 0.0,
-        use_sdpa: bool = False,
-        config: Optional[WavNodeConfig] = None,
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
-        self.config = config
-
-        if (self.head_dim * num_heads) != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {num_heads})."
-            )
-        self.scaling = self.head_dim**-0.5
-
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        if use_sdpa:
-            print("If you want to get attention matrix, please set sdpa to False.")
-            self.attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
-        else:
-            self.attention_interface = eager_attention_forward
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """Attention layer with relative attention"""
-        bsz, tgt_len, _  = hidden_states.size()
-        input_shape = (bsz, tgt_len, -1, self.head_dim)
-
-        # 6) project hidden states
-        query_states = self.q_proj(hidden_states).reshape(*input_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).reshape(*input_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).reshape(*input_shape).transpose(1, 2)
-
-        # 7) apply attention
-        attn_output, attn_weights = self.attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-            dropout=0.0 if not self.training else self.dropout,
-            scaling=self.scaling,
-            output_attentions=output_attentions,
-            head_mask=None,
-            is_causal=False,
-        )
-
-        # 8) apply output projection
-        attn_output = attn_output.reshape(bsz, tgt_len, -1)
-        attn_output = self.out_proj(attn_output)
-
-        return attn_output, attn_weights
-    
-
-class HubertFeedForward(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        
-        self.intermediate_dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
-        self.intermediate_dropout = nn.Dropout(config.activation_dropout)
-
-        self.output_dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.output_dropout = nn.Dropout(config.hidden_dropout)
-
-    def forward(self, 
-                hidden_states: torch.Tensor,
-                ):
-        hidden_states = self.intermediate_dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        hidden_states = self.intermediate_dropout(hidden_states)
-
-        hidden_states = self.output_dense(hidden_states)
-        hidden_states = self.output_dropout(hidden_states)
-        return hidden_states
-
-
-class HubertEncoderLayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.attention = HuBERTAttention(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            dropout=config.attention_dropout,
-            is_decoder=False,
-            config=config,
-        )
-
-        self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(self, hidden_states, attention_mask=None, output_attentions=False):
-        attn_residual = hidden_states
-        hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-        )
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = attn_residual + hidden_states
-
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = hidden_states + self.feed_forward(hidden_states)
-        hidden_states = self.final_layer_norm(hidden_states)
-
-        if output_attentions:
-            return hidden_states, attn_weights
-        else:
-            return hidden_states, None
-    
-
-class WavNodeAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        bias: bool = True,
-        dropout: float = 0.0,
-        use_sdpa: bool = False,
-        rank: int = None,
+        num_buckets: int = 320,
+        max_distance: int = 800,
+        has_relative_position_bias: bool = True,
+        rank: int = 4,
         time_dim: int = 128,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         time_activation: nn.Module = nn.SiLU(),
-        config: Optional[WavNodeConfig] = None,
+        use_sdpa: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
-        self.config = config
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -656,14 +467,14 @@ class WavNodeAttention(nn.Module):
             )
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.k_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.v_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.out_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                               rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.q_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.k_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.v_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.out_proj = Linear(embed_dim, embed_dim, 
+                                rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
 
         if use_sdpa:
             print("If you want to get attention matrix, please set sdpa to False.")
@@ -671,21 +482,93 @@ class WavNodeAttention(nn.Module):
         else:
             self.attention_interface = eager_attention_forward
 
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+
+        self.gru_rel_pos_const = nn.Parameter(torch.ones(1, self.num_heads, 1, 1))
+        self.gru_rel_pos_linear = Linear(self.head_dim, 8, 
+                                         rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+
+        if has_relative_position_bias:
+            self.rel_attn_embed = nn.Embedding(self.num_buckets, self.num_heads)
+
+    def compute_bias(self, query_length: int, key_length: int) -> torch.FloatTensor:
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position
+        relative_position_bucket = self._relative_positions_bucket(relative_position)
+        relative_position_bucket = relative_position_bucket.to(self.rel_attn_embed.weight.device)
+        values = self.rel_attn_embed(relative_position_bucket)
+        values = values.permute([2, 0, 1])
+        return values
+
+    def _relative_positions_bucket(self, relative_positions: torch.FloatTensor) -> torch.FloatTensor:
+        num_buckets = self.num_buckets // 2
+
+        relative_buckets = (relative_positions > 0).to(torch.long) * num_buckets
+        relative_positions = torch.abs(relative_positions)
+
+        max_exact = num_buckets // 2
+        is_small = relative_positions < max_exact
+
+        relative_positions_if_large = torch.log(relative_positions.float() / max_exact)
+        relative_positions_if_large = relative_positions_if_large / math.log(self.max_distance / max_exact)
+        relative_positions_if_large = relative_positions_if_large * (num_buckets - max_exact)
+        relative_position_if_large = (max_exact + relative_positions_if_large).to(torch.long)
+        relative_position_if_large = torch.min(
+            relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+
+        relative_buckets += torch.where(is_small, relative_positions, relative_position_if_large)
+        return relative_buckets
+
     def forward(
         self,
-        t_emb: torch.Tensor,
         hidden_states: torch.Tensor,
+        sinusoidal_emb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_bias: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Attention layer with relative attention"""
         bsz, tgt_len, _  = hidden_states.size()
         input_shape = (bsz, tgt_len, -1, self.head_dim)
 
+        if position_bias is None:
+            # first pass of attention layer creates position bias
+            position_bias = self.compute_bias(tgt_len, tgt_len)
+            position_bias = (
+                position_bias.unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.num_heads, tgt_len, tgt_len)
+            )
+
+        # Compute relative position bias:
+        # 1) get reshape hidden_states
+        gated_hidden_states = hidden_states.reshape(hidden_states.shape[:-1] + (self.num_heads, -1))
+        gated_hidden_states = gated_hidden_states.permute(0, 2, 1, 3)
+
+        # 2) project hidden states
+        relative_position_proj = self.gru_rel_pos_linear(gated_hidden_states, sinusoidal_emb)
+        relative_position_proj = relative_position_proj.reshape(gated_hidden_states.shape[:-1] + (2, 4)).sum(-1)
+
+        # 3) compute gate for position bias from projected hidden states
+        gate_a, gate_b = torch.sigmoid(relative_position_proj).chunk(2, dim=-1)
+        gate_output = gate_a * (gate_b * self.gru_rel_pos_const - 1.0) + 2.0
+
+        # 4) apply gate to position bias to compute gated position_bias
+        gated_position_bias = gate_output.reshape(bsz * self.num_heads, -1, 1) * position_bias
+        gated_position_bias = gated_position_bias.reshape((bsz, self.num_heads, tgt_len, tgt_len))
+
+        # 5) add gated position bias to attention mask
+        # attention mask: [bsz, 1, tgt_len, tgt_len]
+        if attention_mask is not None:
+            updated_attention_mask = attention_mask + gated_position_bias
+        else:
+            updated_attention_mask = gated_position_bias
+
         # 6) project hidden states
-        query_states = self.q_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
-        key_states = self.k_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
-        value_states = self.v_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
 
         # 7) apply attention
         attn_output, attn_weights = self.attention_interface(
@@ -693,7 +576,7 @@ class WavNodeAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            attention_mask=attention_mask,
+            updated_attention_mask,
             dropout=0.0 if not self.training else self.dropout,
             scaling=self.scaling,
             output_attentions=output_attentions,
@@ -703,9 +586,9 @@ class WavNodeAttention(nn.Module):
 
         # 8) apply output projection
         attn_output = attn_output.reshape(bsz, tgt_len, -1)
-        attn_output = self.out_proj(t_emb, attn_output)
+        attn_output = self.out_proj(attn_output, sinusoidal_emb)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, position_bias
 
 
 class WavNodeFeedForward(nn.Module):
@@ -718,30 +601,30 @@ class WavNodeFeedForward(nn.Module):
         else:
             time_activation = config.time_activation
         
-        self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
-                                         rank=config.hidden_size, time_dim=config.time_dim,
-                                         hidden_dim=config.hidden_dim, activation=time_activation)
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
-        
+
+        self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
+                                         rank=config.rank, time_dim=config.time_dim,
+                                         hidden_dim=config.hidden_dim, activation=time_activation)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
         self.output_dense = Linear(config.intermediate_size, config.hidden_size,
-                                   rank=config.hidden_size, time_dim=config.time_dim,
+                                   rank=config.rank, time_dim=config.time_dim,
                                    hidden_dim=config.hidden_dim, activation=time_activation)
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, 
-                t_emb: torch.Tensor,
                 hidden_states: torch.Tensor,
+                sinusoidal_emb: torch.Tensor,
                 ):
-        hidden_states = self.intermediate_dense(t_emb, hidden_states)
+        hidden_states = self.intermediate_dense(hidden_states, sinusoidal_emb)
         hidden_states = self.intermediate_act_fn(hidden_states)
         hidden_states = self.intermediate_dropout(hidden_states)
 
-        hidden_states = self.output_dense(t_emb, hidden_states)
+        hidden_states = self.output_dense(hidden_states, sinusoidal_emb)
         hidden_states = self.output_dropout(hidden_states)
         return hidden_states
 
@@ -757,60 +640,57 @@ class WavNodeEncoderLayer(nn.Module):
         self.attn = WavNodeAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
-            bias=True,
             dropout=config.attention_dropout,
-            use_sdpa=config.use_sdpa,
+            num_buckets=config.num_buckets,
+            max_distance=config.max_bucket_distance,
+            has_relative_position_bias=config.has_relative_position_bias,
             rank=config.rank, 
             time_dim=config.time_dim, 
             hidden_dim=config.hidden_dim,
             time_activation=time_activation,
-            config=config,
+            use_sdpa=config.use_sdpa,
         )
         self.attn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
-                                 time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
-                                 activation=time_activation)
+                                rank=config.rank, time_dim=config.time_dim,
+                                hidden_dim=config.hidden_dim, activation=time_activation)
         self.ffn = WavNodeFeedForward(config)
         self.ffn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
-                                time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
-                                activation=time_activation)
+                                rank=config.rank, time_dim=config.time_dim,
+                                hidden_dim=config.hidden_dim, activation=time_activation)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.time_embed = SinusoidalEmbedding(time_dim=config.time_dim)
-
-        # Pre-collect layers that need orthonormalization to avoid traversal overhead at every step
-        self.ortho_layers = [m for m in self.modules() if isinstance(m, Linear) and hasattr(m, "_orthonormalize")]
-
-    def _orthonormalize(self):
-        for layer in self.ortho_layers:
-            layer._orthonormalize()
+        self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
 
     def forward(self, 
-                time, 
                 hidden_states, 
+                time, 
                 attention_mask=None, 
+                position_bias=None,
                 output_attentions=False, 
             ):
-        t_emb = self.time_embed(time)
+        sinusoidal_emb = self.sinusoidal_emb(time)
         # attn
-        hidden_states_attn = self.attn_ln(t_emb, hidden_states)
-        hidden_states_attn, attn_weights = self.attn(
-            t_emb,
+        hidden_states_attn = self.attn_ln(hidden_states, sinusoidal_emb)
+        hidden_states_attn, attn_weights, position_bias = self.attn(
             hidden_states_attn,
+            sinusoidal_emb,
             attention_mask=attention_mask,
+            position_bias=position_bias,
             output_attentions=output_attentions,
         )
         hidden_states_attn = self.dropout(hidden_states_attn)
 
         # ffn
-        hidden_states_ffn = self.ffn_ln(t_emb, hidden_states)
-        hidden_states_ffn = self.ffn(t_emb, hidden_states_ffn)
+        hidden_states_ffn = self.ffn_ln(hidden_states, sinusoidal_emb)
+        hidden_states_ffn = self.ffn(hidden_states_ffn, sinusoidal_emb)
         hidden_states_ffn = self.dropout(hidden_states_ffn)
-        
         hidden_states = hidden_states_ffn + hidden_states_attn
 
         if output_attentions:
-            return hidden_states, attn_weights
+            aux_outputs = {'position_bias': position_bias, 'attn_weights': attn_weights}
         else:
-            return hidden_states, None
+            aux_outputs = {'position_bias': position_bias}
+
+        return hidden_states, aux_outputs
 
 
 class WavNodeEncoder(nn.Module):
@@ -820,9 +700,8 @@ class WavNodeEncoder(nn.Module):
         self.pos_conv_embed = WavNodePositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.hubert_layer = HubertEncoderLayer(config)
-        self.ode_layer = WavNodeEncoderLayer(config)
-        self.solver = Solver(f=self.ode_layer, 
+        self.layer = WavNodeEncoderLayer(config)
+        self.solver = Solver(f=self.layer, 
                              step_method=config.step_method, 
                              use_checkpoint=config.use_checkpoint,)
 
@@ -853,36 +732,18 @@ class WavNodeEncoder(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
-        hidden_states, self_attentions = self.hubert_layer(hidden_states, 
-                                                           attention_mask=attention_mask, 
-                                                           output_attentions=output_attentions,)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-        
-        if output_attentions:
-            all_self_attentions = all_self_attentions + (self_attentions,)
-
-        # Solver returns (trajectory, aux_outputs_list)
-        # aux_outputs_list is a list of tuples, e.g., [(attn_w_step1,), (attn_w_step2,), ...]
-        stacked_hidden_states, aux_outputs = self.solver(times, hidden_states,
+        hidden_states, all_self_attentions = self.solver(hidden_states, times,
                                                          return_trajectory=output_hidden_states,
-                                                         attention_mask=attention_mask,
+                                                         attention_mask=attention_mask, 
                                                          output_attentions=output_attentions,)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + tuple(torch.unbind(stacked_hidden_states, dim=0))
-
-        if output_attentions:
-            # Extract attention weights from aux_outputs list of tuples
-            # Each aux_output is expected to be (attn_weights,)
-            step_attentions = tuple(aux[0] for aux in aux_outputs)
-            all_self_attentions = all_self_attentions + step_attentions
+            all_hidden_states = all_hidden_states + tuple(torch.unbind(hidden_states, dim=0))
 
         if not return_dict:
-            return tuple(v for v in [stacked_hidden_states[-1], all_hidden_states, all_self_attentions] if v is not None)
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=stacked_hidden_states[-1],
+            last_hidden_state=hidden_states[-1],
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
@@ -990,10 +851,6 @@ class WavNodeModel(WavNodePreTrainedModel):
         self.config = config
         self.feature_encoder = WavNodeFeatureEncoder(config)
         self.feature_projection = WavNodeFeatureProjection(config)
-        self.feature_grad_mult = config.feature_grad_mult
-        
-        downsampling_rate = np.prod(config.conv_stride)
-        self.feat2label_ratio = config.label_rate * downsampling_rate / config.sample_rate
 
         # model only needs masking vector if mask prob is > 0.0
         if config.mask_time_prob > 0.0 or config.mask_feature_prob > 0.0:
@@ -1061,8 +918,6 @@ class WavNodeModel(WavNodePreTrainedModel):
     def forward(
         self,
         input_values: Optional[torch.Tensor],
-        times: Optional[torch.Tensor],
-        labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
@@ -1080,19 +935,7 @@ class WavNodeModel(WavNodePreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.feature_grad_mult > 0:
-            extract_features = self.feature_encoder(input_values)
-            if self.feature_grad_mult != 1.0:
-                extract_features = GradMultiply.apply(extract_features, self.feature_grad_mult)
-        else:
-            with torch.no_grad():
-                extract_features = self.feature_encoder(input_values)
-
-        if labels is not None:
-            extract_features, labels = self.feature_encoder._align_features_and_labels(
-                extract_features, labels, self.feat2label_ratio
-            )
-
+        extract_features = self.feature_encoder(input_values)
         extract_features = extract_features.transpose(1, 2)
 
         if attention_mask is not None:
@@ -1108,7 +951,6 @@ class WavNodeModel(WavNodePreTrainedModel):
 
         encoder_outputs = self.encoder(
             hidden_states,
-            times=times,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1118,12 +960,11 @@ class WavNodeModel(WavNodePreTrainedModel):
         hidden_states = encoder_outputs[0]
 
         if not return_dict:
-            return (hidden_states, extract_features, attention_mask) + encoder_outputs[1:]
+            return (hidden_states, extract_features) + encoder_outputs[1:]
 
         return WavNodeBaseModelOutput(
             last_hidden_state=hidden_states,
             extract_features=extract_features,
-            attention_mask=attention_mask,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
@@ -1137,29 +978,23 @@ class WavNodeModel(WavNodePreTrainedModel):
 class WavNodeForPreTraining(WavNodePreTrainedModel):
     def __init__(self, config: WavNodeConfig):
         super().__init__(config)
-        self.config = config
-
         # wavnode model
         self.wavnode = WavNodeModel(config)
 
         # for pretraining head
+        self.final_proj = nn.Linear(config.hidden_size, config.codevector_dim)
+        self.label_embs = nn.Parameter(torch.FloatTensor(config.num_classes, config.codevector_dim))
+        nn.init.uniform_(self.label_embs)
+
         if getattr(config, "use_target_glu", False):
             self.target_glu = nn.Sequential(
                 nn.Linear(config.codevector_dim, 2 * config.codevector_dim),
-                nn.GLU(),
+                nn.GLU(dim=-1),
             )
-        else:
-            self.target_glu = None
-        
-        self.final_proj = nn.Linear(config.hidden_size, config.codevector_dim)
-        self.label_embs = nn.Parameter(torch.FloatTensor(config.num_classes, config.codevector_dim))
-        self.num_classes = config.num_classes
-        nn.init.uniform_(self.label_embs)
 
+        feature_ds_rate = np.prod(config.conv_stride)
+        self.feat2tar_ratio = config.label_rate * feature_ds_rate / config.sample_rate
         self.logits_temperature = config.logits_temperature
-        self.loss_fn = CrossEntropyLoss(ignore_index=-100, 
-                                        reduction=config.nce_loss_reduction, 
-                                        label_smoothing=config.label_smoothing)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1183,93 +1018,152 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
         """
         self.wavnode.feature_encoder._freeze_parameters()
 
-    def _compute_nce(
+    def _compute_pred(self, proj_x: torch.Tensor, label_embs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute class logits for HuBERT-style masked prediction.
+
+        Args:
+            proj_x: Tensor of shape (N_mask, D)
+            label_embs: Tensor of shape (K, D)
+        Returns:
+            logits: Tensor of shape (N_mask, K)
+        """
+        if getattr(self.config, "use_target_glu", False):
+            label_embs = self.target_glu(label_embs)
+
+        if getattr(self.config, "use_cosine_similarity", True):
+            proj_x = F.normalize(proj_x, dim=-1)
+            label_embs = F.normalize(label_embs, dim=-1)
+            logits = torch.matmul(proj_x, label_embs.transpose(0, 1))
+        else:
+            logits = torch.matmul(proj_x, label_embs.transpose(0, 1))
+
+        logits = logits / self.logits_temperature
+        return logits
+
+    def _forward_targets(
         self,
-        hidden_states: torch.FloatTensor,
-        positive_state: torch.FloatTensor,
-        negative_states: torch.FloatTensor,
-        ) -> torch.FloatTensor:
-
-        pos_is_in_negs = (positive_state == negative_states).all(-1)
-        positive_state = positive_state.unsqueeze(0)
-        labels = torch.cat([positive_state, negative_states], dim=0) # (1+C, S, D)
-
-        logits = torch.cosine_similarity(hidden_states.float().unsqueeze(0), labels.float(), dim=-1) # (1+C, S)
-        logits /= self.logits_temperature
-
-        if pos_is_in_negs.any():
-            logits[1:][pos_is_in_negs] = float("-inf")
-
-        return logits.transpose(0, 1)
+        features: torch.Tensor,
+        target_list: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Trim features to ensure labels exist and then get aligned labels
+        feat_tsz = features.size(2)
+        targ_tsz = min([t.size(1) for t in target_list])
+        if self.feat2tar_ratio * feat_tsz > targ_tsz:
+            feat_tsz = int(targ_tsz / self.feat2tar_ratio)
+            features = features[..., :feat_tsz]
+        target_inds = torch.arange(feat_tsz, device=features.device).float() * self.feat2tar_ratio
+        target_list = [t[:, target_inds.long()] for t in target_list]
+        return features, target_list
 
     def forward(
         self,
         input_values: Optional[torch.Tensor],
-        times: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         mask_time_indices: Optional[torch.BoolTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, WavNodeForPretrainingOutput]:
-
+        
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if mask_time_indices is not None:
+        batch_size, raw_sequence_length = input_values.shape
+
+        # Prepare feature-domain mask if not provided
+        if mask_time_indices is None and self.training and self.config.mask_time_prob > 0:
+            input_lengths = (
+                attention_mask.sum(-1)
+                if attention_mask is not None
+                else torch.full((batch_size,), raw_sequence_length, device=input_values.device, dtype=torch.long)
+            )
+            feat_lengths = self.wavnode._get_feat_extract_output_lengths(input_lengths)
+            max_feat_len = int(feat_lengths.max().item())
+            feat_attn_mask = None
+            if attention_mask is not None:
+                feat_attn_mask = self.wavnode._get_feature_vector_attention_mask(max_feat_len, attention_mask)
+            mask_np = _compute_mask_indices(
+                (batch_size, max_feat_len),
+                mask_prob=self.config.mask_time_prob,
+                mask_length=self.config.mask_time_length,
+                attention_mask=feat_attn_mask,
+                min_masks=self.config.mask_time_min_masks,
+            )
+            mask_time_indices = torch.tensor(mask_np, device=input_values.device, dtype=torch.bool)
+        elif mask_time_indices is not None:
             mask_time_indices = mask_time_indices.to(torch.bool)
 
+        # Forward backbone with mask indices
         outputs = self.wavnode(
-            input_values=input_values,
-            times=times,
-            labels=labels,
+            input_values,
             attention_mask=attention_mask,
             mask_time_indices=mask_time_indices,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        features_penalty = outputs.extract_features.float().pow(2).mean()
 
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs[0]  # (B, T_feat, H)
+        attentions = outputs.attentions if return_dict else None
 
-        def _compute_pred(proj_x, target, label_embs):
-            # compute logits for the i-th label set
-            y = torch.index_select(label_embs, 0, target.long())
-            negs = label_embs.unsqueeze(1).expand(-1, proj_x.size(0), -1)
-            if self.target_glu:
-                y = self.target_glu(y)
-                negs = self.target_glu(negs)
-            # proj_x: (S, D)
-            # y: (S, D)
-            # negs: (Neg, S, D)
-            return self._compute_nce(proj_x, y, negs)
+        # Build feature padding mask
+        if attention_mask is not None:
+            padding_mask = self.wavnode._get_feature_vector_attention_mask(hidden_states.shape[1], attention_mask)
+        else:
+            padding_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool)
 
-        masked_indices = torch.logical_and(outputs.attention_mask, mask_time_indices)
-        masked_states = self.final_proj(hidden_states[masked_indices])
-        masked_logits = _compute_pred(masked_states, labels[masked_indices], self.label_embs)
+        # Align labels to feature frames if provided
+        aligned_labels = None
+        if labels is not None:
+            features_nc_t, [aligned_labels] = self._forward_targets(hidden_states.transpose(1, 2), [labels])
+            new_len = features_nc_t.size(2)
+            if hidden_states.size(1) != new_len:
+                hidden_states = hidden_states[:, :new_len]
+                padding_mask = padding_mask[:, :new_len]
+                if mask_time_indices is not None:
+                    mask_time_indices = mask_time_indices[:, :new_len]
 
-        loss = 0.0
+        # Determine masked positions
+        masked_indices = None
+        if mask_time_indices is not None:
+            masked_indices = mask_time_indices & padding_mask
+        else:
+            # if no mask provided and skip_nomask is True, do not compute loss
+            masked_indices = padding_mask if not getattr(self.config, "skip_nomask", True) else None
 
-        if masked_logits is not None:
-            masked_logits = masked_logits.float()
-            targ_m = torch.zeros(masked_logits.shape[0], dtype=torch.long, device=masked_logits.device)
-            nce_loss = self.loss_fn(masked_logits, targ_m)
-            
-            loss += nce_loss + self.config.features_penalty_weight * features_penalty
+        # Project and compute logits/loss
+        projected_states = self.final_proj(hidden_states)
+
+        loss = None
+        if aligned_labels is not None:
+            # if there are masked indices, compute the loss
+            if masked_indices is not None and masked_indices.any():
+                proj_x_m = projected_states[masked_indices]
+                logits_m = self._compute_pred(proj_x_m, self.label_embs)
+
+                targets_m = aligned_labels[masked_indices]
+                loss = F.cross_entropy(logits_m, targets_m.long())
+            else:
+                # no masked indices, set loss to 0
+                loss = torch.tensor(0.0, device=projected_states.device, dtype=projected_states.dtype)
+
+        if not return_dict:
+            return (loss, projected_states) + outputs[2:]
 
         return WavNodeForPretrainingOutput(
             loss=loss,
+            projected_states=projected_states,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            nce_loss=nce_loss,
+            nce_loss=None,
             stiffness_loss=None,
-            features_penalty=features_penalty,
         )
 
 
 __all__ = [
+    "WavNodeEncoderLayer",
+    "WavNodeEncoder",
     "WavNodeModel",
-    "WavNodePreTrainedModel",
-    "WavNodeForPreTraining",
+    "WavNodePreTrainedModel"
 ]

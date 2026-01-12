@@ -133,9 +133,11 @@ class WavNodeConfig(PretrainedConfig):
         num_negatives (`int`, *optional*, defaults to 100):
             Number of negative samples for the contrastive loss.
         codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the codevectors.
+            Dimensionality of the quantized feature vectors.
         proj_codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the final projection of the codevectors.
+            Dimensionality of the final projection of both the quantized and the transformer features.
+        diversity_loss_weight (`int`, *optional*, defaults to 0.1):
+            The weight of the codebook diversity loss component.
         ctc_loss_reduction (`str`, *optional*, defaults to `"mean"`):
             Specifies the reduction to apply to the output of `torch.nn.CTCLoss`. Only relevant when training an
             instance of [`WavLMForCTC`].
@@ -192,6 +194,7 @@ class WavNodeConfig(PretrainedConfig):
         hidden_size=768,
         num_attention_heads=12,
         use_sdpa=True,
+        has_relative_position_bias=True,
         intermediate_size=3072,
         hidden_act="gelu",
         hidden_dropout=0.1,
@@ -200,7 +203,6 @@ class WavNodeConfig(PretrainedConfig):
         feat_proj_dropout=0.0,
         final_dropout=0.1,
         initializer_range=0.02,
-        feature_grad_mult=0.1,
         layer_norm_eps=1e-5,
         feat_extract_norm="group",
         feat_extract_activation="gelu",
@@ -210,6 +212,8 @@ class WavNodeConfig(PretrainedConfig):
         conv_bias=False,
         num_conv_pos_embeddings=128,
         num_conv_pos_embedding_groups=16,
+        num_buckets=320,
+        max_bucket_distance=800,
         apply_spec_augment=True,
         mask_time_prob=0.05,
         mask_time_length=10,
@@ -222,9 +226,6 @@ class WavNodeConfig(PretrainedConfig):
         use_target_glu=False,
         use_cosine_similarity=True,
         skip_nomask=True,
-        nce_loss_reduction="sum",
-        label_smoothing=0.0,
-        features_penalty_weight=10.0,
         ctc_loss_reduction="mean",
         ctc_zero_infinity=False,
         use_weighted_layer_sum=False,
@@ -235,9 +236,9 @@ class WavNodeConfig(PretrainedConfig):
         label_rate=50,
         sample_rate=16000,
         # TimeModule parameters
-        rank=384,
+        rank=24,
         time_dim=128,
-        hidden_dim=128,
+        hidden_dim=64,
         time_activation="silu",
         step_method="euler",
         use_checkpoint=True,
@@ -251,6 +252,8 @@ class WavNodeConfig(PretrainedConfig):
         self.conv_stride = list(conv_stride)
         self.conv_kernel = list(conv_kernel)
         self.conv_bias = conv_bias
+        self.num_buckets = num_buckets
+        self.max_bucket_distance = max_bucket_distance
         self.num_conv_pos_embeddings = num_conv_pos_embeddings
         self.num_conv_pos_embedding_groups = num_conv_pos_embedding_groups
         self.num_feat_extract_layers = len(self.conv_dim)
@@ -258,6 +261,7 @@ class WavNodeConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.num_attention_heads = num_attention_heads
         self.use_sdpa = use_sdpa
+        self.has_relative_position_bias = has_relative_position_bias
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.activation_dropout = activation_dropout
@@ -267,8 +271,6 @@ class WavNodeConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.num_ctc_classes = num_ctc_classes
         self.vocab_size = vocab_size
-        self.label_rate = label_rate
-        self.sample_rate = sample_rate
 
         if (
             (len(self.conv_stride) != self.num_feat_extract_layers)
@@ -297,14 +299,6 @@ class WavNodeConfig(PretrainedConfig):
         self.use_target_glu = use_target_glu
         self.use_cosine_similarity = use_cosine_similarity
         self.skip_nomask = skip_nomask
-        self.label_rate = label_rate
-        self.sample_rate = sample_rate
-        self.feature_grad_mult = feature_grad_mult
-
-        # NCE loss
-        self.nce_loss_reduction = nce_loss_reduction
-        self.label_smoothing = label_smoothing
-        self.features_penalty_weight = features_penalty_weight
 
         # ctc loss
         self.ctc_loss_reduction = ctc_loss_reduction
