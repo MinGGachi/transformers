@@ -25,7 +25,7 @@ class SinusoidalEmbedding(nn.Module):
                  time_dim: int = 128,
                  max_period: int = 10000,
                  scale: int = 1000,
-                 requires_grad: bool = True,
+                 requires_grad: bool = False,
                  ):
         """
         Args:

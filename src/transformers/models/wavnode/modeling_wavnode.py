@@ -273,37 +273,32 @@ class WavNodePositionalConvEmbedding(nn.Module):
             groups=config.num_conv_pos_embedding_groups,
         )
 
-        self.batch_norm = None
-        if config.conv_pos_batch_norm:
-            self.batch_norm = nn.BatchNorm1d(config.hidden_size)
-        else:
-            weight_norm = nn.utils.weight_norm
-            if hasattr(nn.utils.parametrizations, "weight_norm"):
-                weight_norm = nn.utils.parametrizations.weight_norm
+        weight_norm = nn.utils.weight_norm
+        if hasattr(nn.utils.parametrizations, "weight_norm"):
+            weight_norm = nn.utils.parametrizations.weight_norm
 
-            if is_deepspeed_zero3_enabled():
-                import deepspeed
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
 
-                with deepspeed.zero.GatheredParameters(self.conv.weight, modifier_rank=0):
-                    self.conv = weight_norm(self.conv, name="weight", dim=2)
-                if hasattr(self.conv, "parametrizations"):
-                    weight_g = self.conv.parametrizations.weight.original0
-                    weight_v = self.conv.parametrizations.weight.original1
-                else:
-                    weight_g = self.conv.weight_g
-                    weight_v = self.conv.weight_v
-                deepspeed.zero.register_external_parameter(self, weight_v)
-                deepspeed.zero.register_external_parameter(self, weight_g)
-            else:
+            with deepspeed.zero.GatheredParameters(self.conv.weight, modifier_rank=0):
                 self.conv = weight_norm(self.conv, name="weight", dim=2)
+            if hasattr(self.conv, "parametrizations"):
+                weight_g = self.conv.parametrizations.weight.original0
+                weight_v = self.conv.parametrizations.weight.original1
+            else:
+                weight_g = self.conv.weight_g
+                weight_v = self.conv.weight_v
+            deepspeed.zero.register_external_parameter(self, weight_v)
+            deepspeed.zero.register_external_parameter(self, weight_g)
+        else:
+            self.conv = weight_norm(self.conv, name="weight", dim=2)
 
         self.padding = WavNodeSamePadLayer(config.num_conv_pos_embeddings)
         self.activation = ACT2FN[config.feat_extract_activation]
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.transpose(1, 2)
-        if self.batch_norm is not None:
-            hidden_states = self.batch_norm(hidden_states)
+
         hidden_states = self.conv(hidden_states)
         hidden_states = self.padding(hidden_states)
         hidden_states = self.activation(hidden_states)
@@ -315,9 +310,7 @@ class WavNodePositionalConvEmbedding(nn.Module):
 class WavNodeFeatureProjection(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.feat_proj_layer_norm = config.feat_proj_layer_norm
-        if self.feat_proj_layer_norm:
-            self.layer_norm = nn.LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
+        self.layer_norm = nn.LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
         self.projection = nn.Linear(config.conv_dim[-1], config.hidden_size)
         self.dropout = nn.Dropout(config.feat_proj_dropout)
 
@@ -491,7 +484,7 @@ class WavNodeFeatureEncoder(nn.Module):
                 )
             else:
                 hidden_states = conv_layer(hidden_states)
-
+                
         return hidden_states
 
 
@@ -633,21 +626,21 @@ class WavNodeAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        bias: bool = True,
         dropout: float = 0.0,
-        use_sdpa: bool = False,
-        rank: int = None,
+        num_buckets: int = 320,
+        max_distance: int = 800,
+        has_relative_position_bias: bool = True,
+        rank: int = 4,
         time_dim: int = 128,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         time_activation: nn.Module = nn.SiLU(),
-        config: Optional[WavNodeConfig] = None,
+        use_sdpa: bool = True,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
-        self.config = config
 
         if (self.head_dim * num_heads) != self.embed_dim:
             raise ValueError(
@@ -656,14 +649,14 @@ class WavNodeAttention(nn.Module):
             )
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.k_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.v_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                             rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
-        self.out_proj = Linear(in_features=embed_dim, out_features=embed_dim, bias=bias,
-                               rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.q_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.k_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.v_proj = Linear(embed_dim, embed_dim, 
+                            rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+        self.out_proj = Linear(embed_dim, embed_dim, 
+                                rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
 
         if use_sdpa:
             print("If you want to get attention matrix, please set sdpa to False.")
@@ -671,21 +664,93 @@ class WavNodeAttention(nn.Module):
         else:
             self.attention_interface = eager_attention_forward
 
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+
+        self.gru_rel_pos_const = nn.Parameter(torch.ones(1, self.num_heads, 1, 1))
+        self.gru_rel_pos_linear = Linear(self.head_dim, 8, 
+                                         rank=rank, time_dim=time_dim, hidden_dim=hidden_dim, activation=time_activation)
+
+        if has_relative_position_bias:
+            self.rel_attn_embed = nn.Embedding(self.num_buckets, self.num_heads)
+
+    def compute_bias(self, query_length: int, key_length: int) -> torch.FloatTensor:
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position
+        relative_position_bucket = self._relative_positions_bucket(relative_position)
+        relative_position_bucket = relative_position_bucket.to(self.rel_attn_embed.weight.device)
+        values = self.rel_attn_embed(relative_position_bucket)
+        values = values.permute([2, 0, 1])
+        return values
+
+    def _relative_positions_bucket(self, relative_positions: torch.FloatTensor) -> torch.FloatTensor:
+        num_buckets = self.num_buckets // 2
+
+        relative_buckets = (relative_positions > 0).to(torch.long) * num_buckets
+        relative_positions = torch.abs(relative_positions)
+
+        max_exact = num_buckets // 2
+        is_small = relative_positions < max_exact
+
+        relative_positions_if_large = torch.log(relative_positions.float() / max_exact)
+        relative_positions_if_large = relative_positions_if_large / math.log(self.max_distance / max_exact)
+        relative_positions_if_large = relative_positions_if_large * (num_buckets - max_exact)
+        relative_position_if_large = (max_exact + relative_positions_if_large).to(torch.long)
+        relative_position_if_large = torch.min(
+            relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+
+        relative_buckets += torch.where(is_small, relative_positions, relative_position_if_large)
+        return relative_buckets
+
     def forward(
         self,
-        t_emb: torch.Tensor,
         hidden_states: torch.Tensor,
+        sinusoidal_emb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_bias: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Attention layer with relative attention"""
         bsz, tgt_len, _  = hidden_states.size()
         input_shape = (bsz, tgt_len, -1, self.head_dim)
 
+        if position_bias is None:
+            # first pass of attention layer creates position bias
+            position_bias = self.compute_bias(tgt_len, tgt_len)
+            position_bias = (
+                position_bias.unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.num_heads, tgt_len, tgt_len)
+            )
+
+        # Compute relative position bias:
+        # 1) get reshape hidden_states
+        gated_hidden_states = hidden_states.reshape(hidden_states.shape[:-1] + (self.num_heads, -1))
+        gated_hidden_states = gated_hidden_states.permute(0, 2, 1, 3)
+
+        # 2) project hidden states
+        relative_position_proj = self.gru_rel_pos_linear(gated_hidden_states, sinusoidal_emb)
+        relative_position_proj = relative_position_proj.reshape(gated_hidden_states.shape[:-1] + (2, 4)).sum(-1)
+
+        # 3) compute gate for position bias from projected hidden states
+        gate_a, gate_b = torch.sigmoid(relative_position_proj).chunk(2, dim=-1)
+        gate_output = gate_a * (gate_b * self.gru_rel_pos_const - 1.0) + 2.0
+
+        # 4) apply gate to position bias to compute gated position_bias
+        gated_position_bias = gate_output.reshape(bsz * self.num_heads, -1, 1) * position_bias
+        gated_position_bias = gated_position_bias.reshape((bsz, self.num_heads, tgt_len, tgt_len))
+
+        # 5) add gated position bias to attention mask
+        # attention mask: [bsz, 1, tgt_len, tgt_len]
+        if attention_mask is not None:
+            updated_attention_mask = attention_mask + gated_position_bias
+        else:
+            updated_attention_mask = gated_position_bias
+
         # 6) project hidden states
-        query_states = self.q_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
-        key_states = self.k_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
-        value_states = self.v_proj(t_emb, hidden_states).reshape(*input_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states, sinusoidal_emb).reshape(*input_shape).transpose(1, 2)
 
         # 7) apply attention
         attn_output, attn_weights = self.attention_interface(
@@ -693,7 +758,7 @@ class WavNodeAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            attention_mask=attention_mask,
+            updated_attention_mask,
             dropout=0.0 if not self.training else self.dropout,
             scaling=self.scaling,
             output_attentions=output_attentions,
@@ -703,9 +768,9 @@ class WavNodeAttention(nn.Module):
 
         # 8) apply output projection
         attn_output = attn_output.reshape(bsz, tgt_len, -1)
-        attn_output = self.out_proj(t_emb, attn_output)
+        attn_output = self.out_proj(attn_output, sinusoidal_emb)
 
-        return attn_output, attn_weights
+        return attn_output, attn_weights, position_bias
 
 
 class WavNodeFeedForward(nn.Module):
@@ -718,30 +783,30 @@ class WavNodeFeedForward(nn.Module):
         else:
             time_activation = config.time_activation
         
-        self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
-                                         rank=config.hidden_size, time_dim=config.time_dim,
-                                         hidden_dim=config.hidden_dim, activation=time_activation)
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
-        
+
+        self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
+                                         rank=config.rank, time_dim=config.time_dim,
+                                         hidden_dim=config.hidden_dim, activation=time_activation)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
         self.output_dense = Linear(config.intermediate_size, config.hidden_size,
-                                   rank=config.hidden_size, time_dim=config.time_dim,
+                                   rank=config.rank, time_dim=config.time_dim,
                                    hidden_dim=config.hidden_dim, activation=time_activation)
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, 
-                t_emb: torch.Tensor,
                 hidden_states: torch.Tensor,
+                sinusoidal_emb: torch.Tensor,
                 ):
-        hidden_states = self.intermediate_dense(t_emb, hidden_states)
+        hidden_states = self.intermediate_dense(hidden_states, sinusoidal_emb)
         hidden_states = self.intermediate_act_fn(hidden_states)
         hidden_states = self.intermediate_dropout(hidden_states)
 
-        hidden_states = self.output_dense(t_emb, hidden_states)
+        hidden_states = self.output_dense(hidden_states, sinusoidal_emb)
         hidden_states = self.output_dropout(hidden_states)
         return hidden_states
 
@@ -757,60 +822,57 @@ class WavNodeEncoderLayer(nn.Module):
         self.attn = WavNodeAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
-            bias=True,
             dropout=config.attention_dropout,
-            use_sdpa=config.use_sdpa,
+            num_buckets=config.num_buckets,
+            max_distance=config.max_bucket_distance,
+            has_relative_position_bias=config.has_relative_position_bias,
             rank=config.rank, 
             time_dim=config.time_dim, 
             hidden_dim=config.hidden_dim,
             time_activation=time_activation,
-            config=config,
+            use_sdpa=config.use_sdpa,
         )
         self.attn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
-                                 time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
-                                 activation=time_activation)
+                                rank=config.rank, time_dim=config.time_dim,
+                                hidden_dim=config.hidden_dim, activation=time_activation)
         self.ffn = WavNodeFeedForward(config)
         self.ffn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
-                                time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
-                                activation=time_activation)
+                                rank=config.rank, time_dim=config.time_dim,
+                                hidden_dim=config.hidden_dim, activation=time_activation)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.time_embed = SinusoidalEmbedding(time_dim=config.time_dim)
-
-        # Pre-collect layers that need orthonormalization to avoid traversal overhead at every step
-        self.ortho_layers = [m for m in self.modules() if isinstance(m, Linear) and hasattr(m, "_orthonormalize")]
-
-    def _orthonormalize(self):
-        for layer in self.ortho_layers:
-            layer._orthonormalize()
+        self.sinusoidal_emb = SinusoidalEmbedding(time_dim=config.time_dim)
 
     def forward(self, 
-                time, 
                 hidden_states, 
+                time, 
                 attention_mask=None, 
+                position_bias=None,
                 output_attentions=False, 
             ):
-        t_emb = self.time_embed(time)
+        sinusoidal_emb = self.sinusoidal_emb(time)
         # attn
-        hidden_states_attn = self.attn_ln(t_emb, hidden_states)
-        hidden_states_attn, attn_weights = self.attn(
-            t_emb,
+        hidden_states_attn = self.attn_ln(hidden_states, sinusoidal_emb)
+        hidden_states_attn, attn_weights, position_bias = self.attn(
             hidden_states_attn,
+            sinusoidal_emb,
             attention_mask=attention_mask,
+            position_bias=position_bias,
             output_attentions=output_attentions,
         )
         hidden_states_attn = self.dropout(hidden_states_attn)
 
         # ffn
-        hidden_states_ffn = self.ffn_ln(t_emb, hidden_states)
-        hidden_states_ffn = self.ffn(t_emb, hidden_states_ffn)
+        hidden_states_ffn = self.ffn_ln(hidden_states, sinusoidal_emb)
+        hidden_states_ffn = self.ffn(hidden_states_ffn, sinusoidal_emb)
         hidden_states_ffn = self.dropout(hidden_states_ffn)
-        
         hidden_states = hidden_states_ffn + hidden_states_attn
 
         if output_attentions:
-            return hidden_states, attn_weights
+            aux_outputs = {'position_bias': position_bias, 'attn_weights': attn_weights}
         else:
-            return hidden_states, None
+            aux_outputs = {'position_bias': position_bias}
+
+        return hidden_states, aux_outputs
 
 
 class WavNodeEncoder(nn.Module):
@@ -820,9 +882,8 @@ class WavNodeEncoder(nn.Module):
         self.pos_conv_embed = WavNodePositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.hubert_layer = HubertEncoderLayer(config)
-        self.ode_layer = WavNodeEncoderLayer(config)
-        self.solver = Solver(f=self.ode_layer, 
+        self.layer = WavNodeEncoderLayer(config)
+        self.solver = Solver(f=self.layer, 
                              step_method=config.step_method, 
                              use_checkpoint=config.use_checkpoint,)
 
@@ -853,36 +914,18 @@ class WavNodeEncoder(nn.Module):
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
-        hidden_states, self_attentions = self.hubert_layer(hidden_states, 
-                                                           attention_mask=attention_mask, 
-                                                           output_attentions=output_attentions,)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-        
-        if output_attentions:
-            all_self_attentions = all_self_attentions + (self_attentions,)
-
-        # Solver returns (trajectory, aux_outputs_list)
-        # aux_outputs_list is a list of tuples, e.g., [(attn_w_step1,), (attn_w_step2,), ...]
-        stacked_hidden_states, aux_outputs = self.solver(times, hidden_states,
+        hidden_states, all_self_attentions = self.solver(hidden_states, times,
                                                          return_trajectory=output_hidden_states,
-                                                         attention_mask=attention_mask,
+                                                         attention_mask=attention_mask, 
                                                          output_attentions=output_attentions,)
 
         if output_hidden_states:
-            all_hidden_states = all_hidden_states + tuple(torch.unbind(stacked_hidden_states, dim=0))
-
-        if output_attentions:
-            # Extract attention weights from aux_outputs list of tuples
-            # Each aux_output is expected to be (attn_weights,)
-            step_attentions = tuple(aux[0] for aux in aux_outputs)
-            all_self_attentions = all_self_attentions + step_attentions
+            all_hidden_states = all_hidden_states + tuple(torch.unbind(hidden_states, dim=0))
 
         if not return_dict:
-            return tuple(v for v in [stacked_hidden_states[-1], all_hidden_states, all_self_attentions] if v is not None)
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=stacked_hidden_states[-1],
+            last_hidden_state=hidden_states[-1],
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )

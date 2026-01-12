@@ -192,6 +192,7 @@ class WavNodeConfig(PretrainedConfig):
         hidden_size=768,
         num_attention_heads=12,
         use_sdpa=True,
+        has_relative_position_bias=True,
         intermediate_size=3072,
         hidden_act="gelu",
         hidden_dropout=0.1,
@@ -210,6 +211,8 @@ class WavNodeConfig(PretrainedConfig):
         conv_bias=False,
         num_conv_pos_embeddings=128,
         num_conv_pos_embedding_groups=16,
+        num_buckets=320,
+        max_bucket_distance=800,
         apply_spec_augment=True,
         mask_time_prob=0.05,
         mask_time_length=10,
@@ -235,9 +238,9 @@ class WavNodeConfig(PretrainedConfig):
         label_rate=50,
         sample_rate=16000,
         # TimeModule parameters
-        rank=384,
+        rank=24,
         time_dim=128,
-        hidden_dim=128,
+        hidden_dim=64,
         time_activation="silu",
         step_method="euler",
         use_checkpoint=True,
@@ -251,6 +254,8 @@ class WavNodeConfig(PretrainedConfig):
         self.conv_stride = list(conv_stride)
         self.conv_kernel = list(conv_kernel)
         self.conv_bias = conv_bias
+        self.num_buckets = num_buckets
+        self.max_bucket_distance = max_bucket_distance
         self.num_conv_pos_embeddings = num_conv_pos_embeddings
         self.num_conv_pos_embedding_groups = num_conv_pos_embedding_groups
         self.num_feat_extract_layers = len(self.conv_dim)
@@ -258,6 +263,7 @@ class WavNodeConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.num_attention_heads = num_attention_heads
         self.use_sdpa = use_sdpa
+        self.has_relative_position_bias = has_relative_position_bias
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.activation_dropout = activation_dropout
@@ -267,8 +273,6 @@ class WavNodeConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.num_ctc_classes = num_ctc_classes
         self.vocab_size = vocab_size
-        self.label_rate = label_rate
-        self.sample_rate = sample_rate
 
         if (
             (len(self.conv_stride) != self.num_feat_extract_layers)
