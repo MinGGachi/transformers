@@ -12,11 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# written by Min Jun Choi
-# Ph.D. Student, Music & Audio Research Group, Seoul Nat'l Univ.
-# Last modified: 25.10.15
-"""WavNODE model configuration"""
+"""Hubert model configuration"""
 
 import functools
 import operator
@@ -27,20 +23,18 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-# TODO: self.config.sdpa is used instead of self.config._attn_implementation
+
 class WavNodeConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`WavNodeModel`]. It is used to instantiate an WavNode
-    model according to the specified arguments, defining the model architecture. 
-
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
+
     Args:
         vocab_size (`int`, *optional*, defaults to 32):
-            Vocabulary size of the WavLM model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`WavLMModel`]. Vocabulary size of the model. Defines the different tokens
-            that can be represented by the *inputs_ids* passed to the forward method of [`WavLMModel`].
+            Vocabulary size of the Hubert model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`HubertModel`]. Vocabulary size of the model. Defines the different
+            tokens that can be represented by the *inputs_ids* passed to the forward method of [`HubertModel`].
         hidden_size (`int`, *optional*, defaults to 768):
             Dimensionality of the encoder layers and the pooler layer.
         num_hidden_layers (`int`, *optional*, defaults to 12):
@@ -52,17 +46,14 @@ class WavNodeConfig(PretrainedConfig):
         hidden_act (`str` or `function`, *optional*, defaults to `"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
             `"relu"`, `"selu"` and `"gelu_new"` are supported.
-        hidden_dropout (`float`, *optional*, defaults to 0.1):
+        hidden_dropout(`float`, *optional*, defaults to 0.1):
             The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
-        activation_dropout (`float`, *optional*, defaults to 0.1):
+        activation_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for activations inside the fully connected layer.
-        attention_dropout (`float`, *optional*, defaults to 0.1):
+        attention_dropout(`float`, *optional*, defaults to 0.1):
             The dropout ratio for the attention probabilities.
         final_dropout (`float`, *optional*, defaults to 0.1):
-            The dropout probability for the final projection layer of [`WavLMForCTC`].
-        layerdrop (`float`, *optional*, defaults to 0.1):
-            The LayerDrop probability. See the [LayerDrop paper](see https://arxiv.org/abs/1909.11556) for more
-            details.
+            The dropout probability for the final projection layer of [`Wav2Vec2ForCTC`].
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         layer_norm_eps (`float`, *optional*, defaults to 1e-12):
@@ -71,18 +62,20 @@ class WavNodeConfig(PretrainedConfig):
             The norm to be applied to 1D convolutional layers in feature encoder. One of `"group"` for group
             normalization of only the first 1D convolutional layer or `"layer"` for layer normalization of all 1D
             convolutional layers.
-        feat_proj_dropout (`float`, *optional*, defaults to 0.0):
+        feat_proj_dropout (`float`, *optional*, defaults to 0.1):
             The dropout probability for output of the feature encoder.
+        feat_proj_layer_norm (`bool`, *optional*, defaults to `True`):
+            Whether to apply LayerNorm to the output of the feature encoder.
         feat_extract_activation (`str, `optional`, defaults to `"gelu"`):
             The non-linear activation function (function or string) in the 1D convolutional layers of the feature
             extractor. If string, `"gelu"`, `"relu"`, `"selu"` and `"gelu_new"` are supported.
-        conv_dim (`Tuple[int]` or `List[int]`, *optional*, defaults to `(512, 512, 512, 512, 512, 512, 512)`):
+        conv_dim (`Tuple[int]`, *optional*, defaults to `(512, 512, 512, 512, 512, 512, 512)`):
             A tuple of integers defining the number of input and output channels of each 1D convolutional layer in the
             feature encoder. The length of *conv_dim* defines the number of 1D convolutional layers.
-        conv_stride (`Tuple[int]` or `List[int]`, *optional*, defaults to `(5, 2, 2, 2, 2, 2, 2)`):
+        conv_stride (`Tuple[int]`, *optional*, defaults to `(5, 2, 2, 2, 2, 2, 2)`):
             A tuple of integers defining the stride of each 1D convolutional layer in the feature encoder. The length
             of *conv_stride* defines the number of convolutional layers and has to match the length of *conv_dim*.
-        conv_kernel (`Tuple[int]` or `List[int]`, *optional*, defaults to `(10, 3, 3, 3, 3, 3, 3)`):
+        conv_kernel (`Tuple[int]`, *optional*, defaults to `(10, 3, 3, 3, 3, 3, 3)`):
             A tuple of integers defining the kernel size of each 1D convolutional layer in the feature encoder. The
             length of *conv_kernel* defines the number of convolutional layers and has to match the length of
             *conv_dim*.
@@ -93,18 +86,22 @@ class WavNodeConfig(PretrainedConfig):
             embeddings layer.
         num_conv_pos_embedding_groups (`int`, *optional*, defaults to 16):
             Number of groups of 1D convolutional positional embeddings layer.
+        conv_pos_batch_norm (`bool`, *optional*, defaults to `False`):
+            Whether to use batch norm instead of weight norm in conv_pos
         do_stable_layer_norm (`bool`, *optional*, defaults to `False`):
-            Whether to apply *stable* layer norm architecture of the Transformer encoder. `do_stable_layer_norm is
+            Whether do apply *stable* layer norm architecture of the Transformer encoder. `do_stable_layer_norm is
             True` corresponds to applying layer norm before the attention layer, whereas `do_stable_layer_norm is
             False` corresponds to applying layer norm after the attention layer.
         apply_spec_augment (`bool`, *optional*, defaults to `True`):
             Whether to apply *SpecAugment* data augmentation to the outputs of the feature encoder. For reference see
             [SpecAugment: A Simple Data Augmentation Method for Automatic Speech
             Recognition](https://arxiv.org/abs/1904.08779).
-        mask_time_prob (`float`, *optional*, defaults to 0.05):
-            Probability of each feature vector along the time axis to be chosen as the start of the vector span to be
-            masked. Approximately `mask_time_prob * sequence_length // mask_time_length` feature vectors will be masked
-            along the time axis. This is only relevant if `apply_spec_augment is True`.
+        mask_time_prob (`float`, *optional*, defaults to 0.80):
+            Percentage (between 0 and 1) of all feature vectors along the time axis which will be masked. The masking
+            procedure generates ''mask_time_prob*len(time_axis)/mask_time_length'' independent masks over the axis. If
+            reasoning from the probability of each feature vector to be chosen as the start of the vector span to be
+            masked, *mask_time_prob* should be `prob_vector_start*mask_time_length`. Note that overlap may decrease the
+            actual percentage of masked vectors. This is only relevant if `apply_spec_augment is True`.
         mask_time_length (`int`, *optional*, defaults to 10):
             Length of vector span along the time axis.
         mask_time_min_masks (`int`, *optional*, defaults to 2),:
@@ -112,96 +109,63 @@ class WavNodeConfig(PretrainedConfig):
             irrespectively of `mask_feature_prob`. Only relevant if ''mask_time_prob*len(time_axis)/mask_time_length <
             mask_time_min_masks''
         mask_feature_prob (`float`, *optional*, defaults to 0.0):
-            Probability of each feature vector along the feature axis to be chosen as the start of the vector span to
-            be masked. Approximately `mask_time_prob * hidden_size // mask_time_length` feature vectors will be masked
-            along the time axis. This is only relevant if `apply_spec_augment is True`.
+            Percentage (between 0 and 1) of all feature vectors along the feature axis which will be masked. The
+            masking procedure generates ''mask_feature_prob*len(feature_axis)/mask_time_length'' independent masks over
+            the axis. If reasoning from the probability of each feature vector to be chosen as the start of the vector
+            span to be masked, *mask_feature_prob* should be `prob_vector_start*mask_feature_length`. Note that overlap
+            may decrease the actual percentage of masked vectors. This is only relevant if `apply_spec_augment is
+            True`.
         mask_feature_length (`int`, *optional*, defaults to 10):
             Length of vector span along the feature axis.
-        use_target_glu (`bool`, *optional*, defaults to `False`):
-            Whether to apply a GLU transform to label embeddings before computing logits during pretraining.
-        use_cosine_similarity (`bool`, *optional*, defaults to `True`):
-            If true, compute class logits via cosine similarity between projected states and label embeddings
-            (temperature-scaled). If false, use dot-product logits (temperature-scaled).
-        skip_nomask (`bool`, *optional*, defaults to `True`):
-            If true, compute loss only on masked timesteps for HuBERT-style pretraining.
-        num_codevectors_per_group (`int`, *optional*, defaults to 320):
-            Number of entries in each quantization codebook (group).
-        num_codevector_groups (`int`, *optional*, defaults to 2):
-            Number of codevector groups for product codevector quantization.
-        contrastive_logits_temperature (`float`, *optional*, defaults to 0.1):
-            The temperature *kappa* in the contrastive loss.
-        num_negatives (`int`, *optional*, defaults to 100):
-            Number of negative samples for the contrastive loss.
-        codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the codevectors.
-        proj_codevector_dim (`int`, *optional*, defaults to 256):
-            Dimensionality of the final projection of the codevectors.
-        ctc_loss_reduction (`str`, *optional*, defaults to `"mean"`):
+        mask_feature_min_masks (`int`, *optional*, defaults to 0),:
+            The minimum number of masks of length `mask_feature_length` generated along the feature axis, each time
+            step, irrespectively of `mask_feature_prob`. Only relevant if
+            ''mask_feature_prob*len(feature_axis)/mask_feature_length < mask_feature_min_masks''
+        ctc_loss_reduction (`str`, *optional*, defaults to `"sum"`):
             Specifies the reduction to apply to the output of `torch.nn.CTCLoss`. Only relevant when training an
-            instance of [`WavLMForCTC`].
+            instance of [`HubertForCTC`].
         ctc_zero_infinity (`bool`, *optional*, defaults to `False`):
             Whether to zero infinite losses and the associated gradients of `torch.nn.CTCLoss`. Infinite losses mainly
             occur when the inputs are too short to be aligned to the targets. Only relevant when training an instance
-            of [`WavLMForCTC`].
+            of [`HubertForCTC`].
         use_weighted_layer_sum (`bool`, *optional*, defaults to `False`):
             Whether to use a weighted average of layer outputs with learned weights. Only relevant when using an
-            instance of [`WavLMForSequenceClassification`].
+            instance of [`HubertForSequenceClassification`].
         classifier_proj_size (`int`, *optional*, defaults to 256):
             Dimensionality of the projection before token mean-pooling for classification.
-        tdnn_dim (`Tuple[int]` or `List[int]`, *optional*, defaults to `(512, 512, 512, 512, 1500)`):
-            A tuple of integers defining the number of output channels of each 1D convolutional layer in the *TDNN*
-            module of the *XVector* model. The length of *tdnn_dim* defines the number of *TDNN* layers.
-        tdnn_kernel (`Tuple[int]` or `List[int]`, *optional*, defaults to `(5, 3, 3, 1, 1)`):
-            A tuple of integers defining the kernel size of each 1D convolutional layer in the *TDNN* module of the
-            *XVector* model. The length of *tdnn_kernel* has to match the length of *tdnn_dim*.
-        tdnn_dilation (`Tuple[int]` or `List[int]`, *optional*, defaults to `(1, 2, 3, 1, 1)`):
-            A tuple of integers defining the dilation factor of each 1D convolutional layer in *TDNN* module of the
-            *XVector* model. The length of *tdnn_dilation* has to match the length of *tdnn_dim*.
-        xvector_output_dim (`int`, *optional*, defaults to 512):
-            Dimensionality of the *XVector* embedding vectors.
-        output_hidden_size (`int`, *optional*):
-            Dimensionality of the encoder output layer. If not defined, this defaults to *hidden-size*. Only relevant
-            if `add_adapter is True`.
 
     Example:
 
     ```python
+    >>> from transformers import HubertModel, HubertConfig
 
-    ```
+    >>> # Initializing a Hubert facebook/hubert-base-ls960 style configuration
+    >>> configuration = HubertConfig()
 
-    Example:
-
-    ```python
-    >>> from transformers import WavNodeConfig, WavNodeModel
-
-    >>> # Initializing a WavLM facebook/wavlm-base-960h style configuration
-    >>> configuration = WavNodeConfig()
-
-    >>> # Initializing a model (with random weights) from the facebook/wavlm-base-960h style configuration
-    >>> model = WavNodeModel(configuration)
+    >>> # Initializing a model from the facebook/hubert-base-ls960 style configuration
+    >>> model = HubertModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "wavnode"
+    model_type = "hubert"
 
     def __init__(
         self,
         vocab_size=32,
         hidden_size=768,
+        num_hidden_layers=12,
         num_attention_heads=12,
-        use_sdpa=True,
-        has_relative_position_bias=True,
         intermediate_size=3072,
         hidden_act="gelu",
         hidden_dropout=0.1,
-        activation_dropout=0.1,
+        activation_dropout=0.0,
         attention_dropout=0.1,
-        feat_proj_dropout=0.0,
+        feat_proj_layer_norm=True,
+        feat_proj_dropout=0.1,
         final_dropout=0.1,
         initializer_range=0.02,
-        feature_grad_mult=0.1,
         layer_norm_eps=1e-5,
         feat_extract_norm="group",
         feat_extract_activation="gelu",
@@ -211,39 +175,37 @@ class WavNodeConfig(PretrainedConfig):
         conv_bias=False,
         num_conv_pos_embeddings=128,
         num_conv_pos_embedding_groups=16,
-        num_buckets=320,
-        max_bucket_distance=800,
+        conv_pos_batch_norm=False,
+        do_stable_layer_norm=False,
+        rank=384,
+        time_dim=128,
+        hidden_dim=128,
+        time_activation="silu",
+        step_method="euler",
+        use_checkpoint=True,
         apply_spec_augment=True,
-        mask_time_prob=0.05,
+        mask_time_prob=0.80,
         mask_time_length=10,
         mask_time_min_masks=2,
         mask_feature_prob=0.0,
         mask_feature_length=10,
-        logits_temperature=0.1,
-        num_classes=500,
-        codevector_dim=256,
-        use_target_glu=False,
-        use_cosine_similarity=True,
-        skip_nomask=True,
-        nce_loss_reduction="sum",
-        label_smoothing=0.0,
-        features_penalty_weight=10.0,
-        ctc_loss_reduction="mean",
+        mask_feature_min_masks=0,
+        ctc_loss_reduction="sum",
         ctc_zero_infinity=False,
         use_weighted_layer_sum=False,
-        num_ctc_classes=80,
+        classifier_proj_size=256,
+        # Pretraining config parameters
+        label_rate=50,
+        sample_rate=16000,
+        codevector_dim=256, 
+        use_target_glu=False,
+        num_classes=500,
+        logits_temperature=0.1,
+        nce_loss_reduction="mean",
+        label_smoothing=0.0,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
-        label_rate=50,
-        sample_rate=16000,
-        # TimeModule parameters
-        rank=24,
-        time_dim=128,
-        hidden_dim=64,
-        time_activation="silu",
-        step_method="euler",
-        use_checkpoint=True,
         **kwargs,
     ):
         super().__init__(**kwargs, pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id)
@@ -254,25 +216,45 @@ class WavNodeConfig(PretrainedConfig):
         self.conv_stride = list(conv_stride)
         self.conv_kernel = list(conv_kernel)
         self.conv_bias = conv_bias
-        self.num_buckets = num_buckets
-        self.max_bucket_distance = max_bucket_distance
         self.num_conv_pos_embeddings = num_conv_pos_embeddings
         self.num_conv_pos_embedding_groups = num_conv_pos_embedding_groups
+        self.conv_pos_batch_norm = conv_pos_batch_norm
         self.num_feat_extract_layers = len(self.conv_dim)
+        self.num_hidden_layers = num_hidden_layers
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
         self.num_attention_heads = num_attention_heads
-        self.use_sdpa = use_sdpa
-        self.has_relative_position_bias = has_relative_position_bias
         self.hidden_dropout = hidden_dropout
         self.attention_dropout = attention_dropout
         self.activation_dropout = activation_dropout
+        self.feat_proj_layer_norm = feat_proj_layer_norm
         self.feat_proj_dropout = feat_proj_dropout
         self.final_dropout = final_dropout
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
-        self.num_ctc_classes = num_ctc_classes
         self.vocab_size = vocab_size
+        self.do_stable_layer_norm = do_stable_layer_norm
+        self.use_weighted_layer_sum = use_weighted_layer_sum
+        self.classifier_proj_size = classifier_proj_size
+        self._attn_implementation = "flash_attention_2"
+        
+        # Pretraining config
+        self.label_rate = label_rate
+        self.sample_rate = sample_rate
+        self.codevector_dim = codevector_dim
+        self.use_target_glu = use_target_glu
+        self.num_classes = num_classes
+        self.logits_temperature = logits_temperature
+        self.nce_loss_reduction = nce_loss_reduction
+        self.label_smoothing = label_smoothing
+
+        # TimeModule parameters
+        self.rank = rank
+        self.time_dim = time_dim
+        self.hidden_dim = hidden_dim
+        self.time_activation = time_activation
+        self.step_method = step_method
+        self.use_checkpoint = use_checkpoint
 
         if (
             (len(self.conv_stride) != self.num_feat_extract_layers)
@@ -293,38 +275,15 @@ class WavNodeConfig(PretrainedConfig):
         self.mask_time_min_masks = mask_time_min_masks
         self.mask_feature_prob = mask_feature_prob
         self.mask_feature_length = mask_feature_length
-
-        # parameters for pretraining with codevector quantized representations
-        self.logits_temperature = logits_temperature
-        self.codevector_dim = codevector_dim
-        self.num_classes = num_classes
-        self.use_target_glu = use_target_glu
-        self.use_cosine_similarity = use_cosine_similarity
-        self.skip_nomask = skip_nomask
-        self.label_rate = label_rate
-        self.sample_rate = sample_rate
-        self.feature_grad_mult = feature_grad_mult
-
-        # NCE loss
-        self.nce_loss_reduction = nce_loss_reduction
-        self.label_smoothing = label_smoothing
-        self.features_penalty_weight = features_penalty_weight
+        self.mask_feature_min_masks = mask_feature_min_masks
 
         # ctc loss
         self.ctc_loss_reduction = ctc_loss_reduction
         self.ctc_zero_infinity = ctc_zero_infinity
 
-        # TimeModule parameters
-        self.rank = rank
-        self.time_dim = time_dim
-        self.hidden_dim = hidden_dim
-        self.time_activation = time_activation
-        self.step_method = step_method
-        self.use_checkpoint = use_checkpoint
-
     @property
     def inputs_to_logits_ratio(self):
         return functools.reduce(operator.mul, self.conv_stride, 1)
-
+    
 
 __all__ = ["WavNodeConfig"]

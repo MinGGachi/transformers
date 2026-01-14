@@ -39,6 +39,9 @@ def power_iter_sigma_max(
     def _init_vec(mode_: str) -> Tensor:
         dim = m if mode_ == "u" else n
         v = torch.randn(dim, 1, device=W.device, dtype=compute_dtype)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(v, src=0)
+            
         v = v / (v.norm() + eps)
         return v
 

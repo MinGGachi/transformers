@@ -143,7 +143,7 @@ class Linear(nn.Module):
                                  beta=0.8,)
         self.U = nn.Parameter(torch.randn((out_features, rank), **factory_kwargs))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(self.out_features))
+            self.bias = nn.Parameter(torch.zeros(self.out_features, **factory_kwargs))
         else:
             self.register_parameter('bias', None)
 
