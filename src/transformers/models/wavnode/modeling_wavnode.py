@@ -1377,10 +1377,10 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
         )
 
 class WavNodeForSUPERB(WavNodeModel):
-    def __init__(self, config: WavNodeConfig, time_steps: int=12):
+    def __init__(self, config: WavNodeConfig, time_steps: int=11):
         super().__init__(config)
         self.wavnode = WavNodeModel(config).eval()
-        self.times = torch.linspace(0, 1, steps=time_steps)
+        self.times = torch.linspace(0, 1, steps=time_steps + )
 
     def forward(self,
                 input_values: Optional[torch.Tensor],
