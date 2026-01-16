@@ -1376,6 +1376,30 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
             stiffness_loss=None,
         )
 
+class WavNodeForSUPERB(WavNodeModel):
+    def __init__(self, config: WavNodeConfig, time_steps: int=12):
+        super().__init__(config)
+        self.wavnode = WavNodeModel(config).eval()
+        self.times = torch.linspace(0, 1, steps=time_steps)
+
+    def forward(self,
+                input_values: Optional[torch.Tensor],
+                attention_mask: Optional[torch.Tensor] = None,
+                mask_time_indices: Optional[torch.FloatTensor] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, WavNodeForPretrainingOutput]:
+
+        output = self.wavnode(times=self.times,
+                              input_values=input_values,
+                              attention_mask=attention_mask,
+                              mask_time_indices=mask_time_indices,
+                              output_attentions=output_attentions,
+                              output_hidden_states=output_hidden_states,
+                              return_dict=return_dict,)
+
+        return output
 
 __all__ = [
     "WavNodeEncoderLayer",
@@ -1383,4 +1407,5 @@ __all__ = [
     "WavNodeModel",
     "WavNodePreTrainedModel",
     "WavNodeForPreTraining",
+    "WavNodeForSUPERB",
 ]
