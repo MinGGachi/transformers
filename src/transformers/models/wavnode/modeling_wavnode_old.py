@@ -800,7 +800,7 @@ class WavNodeFeedForward(nn.Module):
             time_activation = config.time_activation
         
         self.intermediate_dense = Linear(config.hidden_size, config.intermediate_size,
-                                         rank=2 * config.rank, time_dim=config.time_dim,
+                                         rank=config.hidden_size, time_dim=config.time_dim,
                                          hidden_dim=config.hidden_dim, activation=time_activation)
         self.intermediate_dropout = nn.Dropout(config.activation_dropout)
         
@@ -810,7 +810,7 @@ class WavNodeFeedForward(nn.Module):
             self.intermediate_act_fn = config.hidden_act
 
         self.output_dense = Linear(config.intermediate_size, config.hidden_size,
-                                   rank=2 * config.rank, time_dim=config.time_dim,
+                                   rank=config.hidden_size, time_dim=config.time_dim,
                                    hidden_dim=config.hidden_dim, activation=time_activation)
         self.output_dropout = nn.Dropout(config.hidden_dropout)
 
@@ -827,7 +827,7 @@ class WavNodeFeedForward(nn.Module):
         return hidden_states
 
 
-class WavNodeEncoderSubLayer(nn.Module):
+class WavNodeEncoderLayer(nn.Module):
     def __init__(self, config: WavNodeConfig,):
         super().__init__()
 
@@ -835,7 +835,7 @@ class WavNodeEncoderSubLayer(nn.Module):
             time_activation = ACT2FN[config.time_activation]
         else:
             time_activation = config.time_activation
-        self.attention = WavNodeAttention(
+        self.attn = WavNodeAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
@@ -845,10 +845,16 @@ class WavNodeEncoderSubLayer(nn.Module):
             time_activation=time_activation,
             config=config,
         )
+        self.attn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
+                                 time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
+                                 activation=time_activation)
+        self.ffn = WavNodeFeedForward(config)
+        self.ffn_ln = LayerNorm(config.hidden_size, eps=config.layer_norm_eps, 
+                                time_dim=config.time_dim, hidden_dim=config.hidden_dim, 
+                                activation=time_activation)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.feed_forward = WavNodeFeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.time_embed = SinusoidalEmbedding(time_dim=config.time_dim)
+
         # Pre-collect layers that need orthonormalization to avoid traversal overhead at every step
         self.ortho_layers = [m for m in self.modules() if isinstance(m, Linear) and hasattr(m, "_orthonormalize")]
 
@@ -856,69 +862,41 @@ class WavNodeEncoderSubLayer(nn.Module):
         for layer in self.ortho_layers:
             layer._orthonormalize()
 
-    def _svd_penalty(self, device):
-        svd_penalty = torch.tensor(0.0, device=device)
-        if self.training:
-            for layer in self.ortho_layers:
-                S = layer._sigma
-                svd_penalty = svd_penalty + (S * S).sum()
-
-        return svd_penalty
-
     def forward(self, 
-                t_emb, 
+                time, 
                 hidden_states, 
                 attention_mask=None, 
                 output_attentions=False, 
             ):
-        attn_residual = hidden_states
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states, attn_weights, _ = self.attention(
+        t_emb = self.time_embed(time)
+        # attn
+        hidden_states_attn = self.attn_ln(t_emb, hidden_states)
+        hidden_states_attn, attn_weights, _ = self.attn(
             t_emb,
-            hidden_states, 
-            attention_mask=attention_mask, 
-            output_attentions=output_attentions
+            hidden_states_attn,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
         )
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = attn_residual + hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = hidden_states + self.feed_forward(t_emb, hidden_states)
+        hidden_states_attn = self.dropout(hidden_states_attn)
 
-        outputs = (hidden_states,)
+        # ffn
+        hidden_states_ffn = self.ffn_ln(t_emb, hidden_states)
+        hidden_states_ffn = self.ffn(t_emb, hidden_states_ffn)
+        hidden_states_ffn = self.dropout(hidden_states_ffn)
+        
+        hidden_states = hidden_states_ffn + hidden_states_attn
+
+        # svd penalty
+        svd_penalty = torch.tensor(0.0, device=hidden_states.device)
+        if self.training:
+            for layer in self.ortho_layers:
+                S = layer.S(t_emb)
+                svd_penalty = svd_penalty + (S ** 2).mean()
 
         if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
-
-
-class WavNodeEncoderLayer(nn.Module):
-    def __init__(self, config: WavNodeConfig,):
-        super().__init__()
-        self.time_embed = SinusoidalEmbedding(time_dim=config.time_dim)
-        self.layers = nn.ModuleList(
-            WavNodeEncoderSubLayer(config) for _ in range(config.num_sublayers)
-        )
-
-    def forward(self, 
-                time: torch.Tensor, 
-                hidden_states: torch.Tensor, 
-                attention_mask: Optional[torch.Tensor] = None, 
-                output_attentions: bool = False, 
-            ):
-        t_emb = self.time_embed(time)
-        for layer in self.layers:
-            outputs = layer(t_emb, 
-                            hidden_states, 
-                            attention_mask=attention_mask, 
-                            output_attentions=output_attentions,)
-            hidden_states = outputs[0]
-
-    def _svd_penalty(self, device):
-        svd_penalty = torch.tensor(0.0, device=device)
-        for layer in self.layers:
-            svd_penalty = svd_penalty + layer._svd_penalty(device)
-        return svd_penalty
+            return hidden_states, attn_weights, svd_penalty
+        else:
+            return hidden_states, None, svd_penalty
 
 
 class WavNodeEncoder(nn.Module):
@@ -928,16 +906,24 @@ class WavNodeEncoder(nn.Module):
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(
-            WavNodeEncoderLayer(config) for _ in range(config.num_layers)
-        )
-        self.solvers = nn.ModuleList(
-            Solver(f=layer, step_method=config.step_method, use_checkpoint=config.use_checkpoint,) for layer in self.layers
-        )
-                             
+        self.hubert_layer = HubertEncoderLayer(config)
+        self.ode_layer = WavNodeEncoderLayer(config)
+        self.solver = Solver(f=self.ode_layer, 
+                             step_method=config.step_method, 
+                             use_checkpoint=config.use_checkpoint,)
+        
+    def _freeze_hubert_layer(self):
+        def _freeze(module):
+            for param in module.parameters():
+                param.requires_grad = False
+            module._requires_grad = False
+        _freeze(self.pos_conv_embed)
+        _freeze(self.layer_norm)
+        _freeze(self.hubert_layer)
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.tensor,
         times: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
@@ -977,10 +963,10 @@ class WavNodeEncoder(nn.Module):
 
         # Solver returns (trajectory, aux_outputs_list)
         # aux_outputs_list is a list of tuples, e.g., [(attn_w_step1,), (attn_w_step2,), ...]
-        stacked_hidden_states, aux_outputs = self.solvers(times, hidden_states,
-                                                          return_trajectory=output_hidden_states,
-                                                          attention_mask=attention_mask,
-                                                          output_attentions=output_attentions,)
+        stacked_hidden_states, aux_outputs = self.solver(times, hidden_states,
+                                                         return_trajectory=output_hidden_states,
+                                                         attention_mask=attention_mask,
+                                                         output_attentions=output_attentions,)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + tuple(torch.unbind(stacked_hidden_states, dim=0))

@@ -117,10 +117,12 @@ class Linear(nn.Module):
                  in_features: int,
                  out_features: int,
                  bias: bool = True,
-                 rank: int = None,
+                 rank: int = 64,
                  time_dim: int = 128,
                  hidden_dim: int = 128,
                  activation: nn.Module = nn.SiLU(),
+                 tau=0.2,
+                 beta=0.8,
                  device=None,
                  dtype=None,
                  ):
@@ -129,8 +131,6 @@ class Linear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        if rank is None:
-            rank = min(in_features, out_features) // 2
         self.rank = rank
 
         self.V = nn.Parameter(torch.randn((rank, in_features), **factory_kwargs))
@@ -139,8 +139,8 @@ class Linear(nn.Module):
                                  hidden_dim=hidden_dim,
                                  activation=activation,
                                  rank=rank,
-                                 tau=0.2,
-                                 beta=0.8,)
+                                 tau=tau,
+                                 beta=beta,)
         self.U = nn.Parameter(torch.randn((out_features, rank), **factory_kwargs))
         if bias:
             self.bias = nn.Parameter(torch.zeros(self.out_features, **factory_kwargs))
@@ -152,6 +152,7 @@ class Linear(nn.Module):
         else:
             self.forward_impl = self.forward_expand
 
+        self._sigma: Optional[torch.Tensor] = None
         self._sigma_state_U: Optional[PowerIterState] = None
         self._sigma_state_V: Optional[PowerIterState] = None
 
@@ -165,6 +166,7 @@ class Linear(nn.Module):
                        t: Tensor,
                        x: Tensor,) -> Tensor:
         S = self.S(t)
+        self._sigma = S
 
         x = F.linear(x, weight=self.V)
         x = F.linear(x, weight=self.U * S[None, :], bias=self.bias)
@@ -175,6 +177,7 @@ class Linear(nn.Module):
                        t: Tensor,
                        x: Tensor,) -> Tensor:
         S = self.S(t)
+        self._sigma = S
 
         x = F.linear(x, weight=S[:, None] * self.V)
         x = F.linear(x, weight=self.U, bias=self.bias)

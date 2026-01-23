@@ -155,7 +155,8 @@ class WavNodeConfig(PretrainedConfig):
         self,
         vocab_size=32,
         hidden_size=768,
-        num_hidden_layers=12,
+        num_layers=4,
+        num_sublayers=2,
         num_attention_heads=12,
         intermediate_size=3072,
         hidden_act="gelu",
@@ -177,7 +178,7 @@ class WavNodeConfig(PretrainedConfig):
         num_conv_pos_embedding_groups=16,
         conv_pos_batch_norm=False,
         do_stable_layer_norm=False,
-        rank=384,
+        rank=128,
         time_dim=128,
         hidden_dim=128,
         time_activation="silu",
@@ -220,7 +221,7 @@ class WavNodeConfig(PretrainedConfig):
         self.num_conv_pos_embedding_groups = num_conv_pos_embedding_groups
         self.conv_pos_batch_norm = conv_pos_batch_norm
         self.num_feat_extract_layers = len(self.conv_dim)
-        self.num_hidden_layers = num_hidden_layers
+        self.num_sublayers = num_sublayers
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
         self.num_attention_heads = num_attention_heads
