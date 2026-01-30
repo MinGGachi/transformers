@@ -30,4 +30,16 @@ else:
     import sys
 
     _file = globals()["__file__"]
-    sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)
+    
+    # Explicitly define import structure to avoid loading modeling_wavnode_old
+    _import_structure = {
+        "configuration_wavnode": ["WavNodeConfig"],
+        "modeling_wavnode": [
+            "WavNodeForPreTraining", 
+            "WavNodeModel", 
+            "WavNodePreTrainedModel", 
+            "WavNodeForPretrainingOutput"
+        ],
+    }
+
+    sys.modules[__name__] = _LazyModule(__name__, _file, _import_structure, module_spec=__spec__)

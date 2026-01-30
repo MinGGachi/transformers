@@ -292,9 +292,6 @@ if TYPE_CHECKING:
     from .time_series_transformer import *
     from .timesfm import *
     from .timesformer import *
-    #### time varying transformer ####
-    from .time_wav2vec2 import *
-    #### time_wav2vec2 ####
     from .timm_backbone import *
     from .timm_wrapper import *
     from .trocr import *

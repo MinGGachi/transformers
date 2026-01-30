@@ -155,8 +155,7 @@ class WavNodeConfig(PretrainedConfig):
         self,
         vocab_size=32,
         hidden_size=768,
-        num_layers=4,
-        num_sublayers=2,
+        num_layers=2,
         num_attention_heads=12,
         intermediate_size=3072,
         hidden_act="gelu",
@@ -178,7 +177,7 @@ class WavNodeConfig(PretrainedConfig):
         num_conv_pos_embedding_groups=16,
         conv_pos_batch_norm=False,
         do_stable_layer_norm=False,
-        rank=128,
+        rank=384,
         time_dim=128,
         hidden_dim=128,
         time_activation="silu",
@@ -204,6 +203,11 @@ class WavNodeConfig(PretrainedConfig):
         logits_temperature=0.1,
         nce_loss_reduction="mean",
         label_smoothing=0.0,
+        # Distillation config
+        distil_l1_weight=1.0,
+        distil_cos_weight=1.0,
+        distil_cos_type="raw",
+        weight_decay=0.01,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
@@ -220,8 +224,10 @@ class WavNodeConfig(PretrainedConfig):
         self.num_conv_pos_embeddings = num_conv_pos_embeddings
         self.num_conv_pos_embedding_groups = num_conv_pos_embedding_groups
         self.conv_pos_batch_norm = conv_pos_batch_norm
+        self.do_stable_layer_norm = do_stable_layer_norm
+        self.do_stable_layer_norm = do_stable_layer_norm
         self.num_feat_extract_layers = len(self.conv_dim)
-        self.num_sublayers = num_sublayers
+        self.num_layers = num_layers
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
         self.num_attention_heads = num_attention_heads
@@ -234,7 +240,6 @@ class WavNodeConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
         self.vocab_size = vocab_size
-        self.do_stable_layer_norm = do_stable_layer_norm
         self.use_weighted_layer_sum = use_weighted_layer_sum
         self.classifier_proj_size = classifier_proj_size
         self._attn_implementation = "flash_attention_2"
@@ -248,6 +253,10 @@ class WavNodeConfig(PretrainedConfig):
         self.logits_temperature = logits_temperature
         self.nce_loss_reduction = nce_loss_reduction
         self.label_smoothing = label_smoothing
+        self.distil_l1_weight = distil_l1_weight
+        self.distil_cos_weight = distil_cos_weight
+        self.distil_cos_type = distil_cos_type
+        self.weight_decay = weight_decay
 
         # TimeModule parameters
         self.rank = rank
