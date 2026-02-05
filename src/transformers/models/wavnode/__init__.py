@@ -38,7 +38,8 @@ else:
             "WavNodeForPreTraining", 
             "WavNodeModel", 
             "WavNodePreTrainedModel", 
-            "WavNodeForPretrainingOutput"
+            "WavNodeForPretrainingOutput",
+            "WavNodeForSUPERB",
         ],
     }
 

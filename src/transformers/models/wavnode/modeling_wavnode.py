@@ -967,9 +967,6 @@ class WavNodeEncoder(nn.Module):
 
         hidden_states = hidden_states.detach()
 
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
         # Solver returns (trajectory, aux_outputs_list)
         # aux_outputs_list is a list of tuples, e.g., [(attn_w_step1,), (attn_w_step2,), ...]
         stacked_hidden_states, aux_outputs = self.solver(times, hidden_states,
@@ -1454,7 +1451,7 @@ class WavNodeForSUPERB(WavNodeModel):
     def __init__(self, config: WavNodeConfig, time_steps: int=11):
         super().__init__(config)
         self.wavnode = WavNodeModel(config).eval()
-        self.times = torch.linspace(0, 1, steps=time_steps + 1)
+        self.register_buffer("times", torch.linspace(0, 1, steps=time_steps + 1))
 
     def forward(self,
                 input_values: Optional[torch.Tensor],
