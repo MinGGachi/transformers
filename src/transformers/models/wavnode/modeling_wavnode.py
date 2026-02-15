@@ -19,6 +19,7 @@
 # Last modified: 25.09.25
 ####
 """PyTorch WavNode model."""
+import copy
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Callable, List
@@ -467,188 +468,6 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class HubertAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        is_decoder: bool = False,
-        bias: bool = True,
-        is_causal: bool = False,
-        config: Optional[HubertConfig] = None,
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.dropout = dropout
-        self.head_dim = embed_dim // num_heads
-        self.config = config
-
-        if (self.head_dim * num_heads) != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {num_heads})."
-            )
-        self.scaling = self.head_dim**-0.5
-        self.is_decoder = is_decoder
-        self.is_causal = is_causal
-
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        key_value_states: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        layer_head_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-        # TODO: we need a refactor so that the different attention modules can get their specific kwargs
-        # ATM, we have mixed things encoder, decoder, and encoder-decoder attn
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """Input shape: Batch x Time x Channel"""
-
-        # if key_value_states are provided this layer is used as a cross-attention layer
-        # for the decoder
-        is_cross_attention = key_value_states is not None
-
-        # determine input shapes
-        bsz, tgt_len = hidden_states.shape[:-1]
-        src_len = key_value_states.shape[1] if is_cross_attention else tgt_len
-
-        q_input_shape = (bsz, tgt_len, -1, self.head_dim)
-        kv_input_shape = (bsz, src_len, -1, self.head_dim)
-
-        # get query proj
-        query_states = self.q_proj(hidden_states).view(*q_input_shape).transpose(1, 2)
-
-        # get key, value proj
-        # `past_key_value[0].shape[2] == key_value_states.shape[1]`
-        # is checking that the `sequence_length` of the `past_key_value` is the same as
-        # the provided `key_value_states` to support prefix tuning
-        if (
-            is_cross_attention
-            and past_key_value is not None
-            and past_key_value[0].shape[2] == key_value_states.shape[1]
-        ):
-            # reuse k,v, cross_attentions
-            key_states = past_key_value[0]
-            value_states = past_key_value[1]
-        elif is_cross_attention:
-            # cross_attentions
-            key_states = self.k_proj(key_value_states).view(*kv_input_shape).transpose(1, 2)
-            value_states = self.v_proj(key_value_states).view(*kv_input_shape).transpose(1, 2)
-        elif past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = self.k_proj(hidden_states).view(*kv_input_shape).transpose(1, 2)
-            value_states = self.v_proj(hidden_states).view(*kv_input_shape).transpose(1, 2)
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
-        else:
-            # self_attention
-            key_states = self.k_proj(hidden_states).view(*kv_input_shape).transpose(1, 2)
-            value_states = self.v_proj(hidden_states).view(*kv_input_shape).transpose(1, 2)
-
-        if self.is_decoder:
-            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
-            # Further calls to cross_attention layer can then reuse all cross-attention
-            # key/value_states (first "if" case)
-            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
-            # all previous decoder key/value_states. Further calls to uni-directional self-attention
-            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
-            # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_states, value_states)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.dropout,
-            scaling=self.scaling,
-            output_attentions=output_attentions,
-            head_mask=layer_head_mask,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(bsz, tgt_len, -1).contiguous()
-        attn_output = self.out_proj(attn_output)
-
-        return attn_output, attn_weights, past_key_value
-    
-
-class HubertFeedForward(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        
-        self.intermediate_dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
-        self.intermediate_dropout = nn.Dropout(config.activation_dropout)
-
-        self.output_dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.output_dropout = nn.Dropout(config.hidden_dropout)
-
-    def forward(self, 
-                hidden_states: torch.Tensor,
-                ):
-        hidden_states = self.intermediate_dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        hidden_states = self.intermediate_dropout(hidden_states)
-
-        hidden_states = self.output_dense(hidden_states)
-        hidden_states = self.output_dropout(hidden_states)
-        return hidden_states
-
-
-class HubertEncoderLayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.attention = HubertAttention(
-            embed_dim=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            dropout=config.attention_dropout,
-            is_decoder=False,
-            config=config,
-        )
-
-        self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.feed_forward = HubertFeedForward(config)
-        self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(self, hidden_states, attention_mask=None, output_attentions=False):
-        attn_residual = hidden_states
-        hidden_states, attn_weights, _ = self.attention(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-        )
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = attn_residual + hidden_states
-
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = hidden_states + self.feed_forward(hidden_states)
-        hidden_states = self.final_layer_norm(hidden_states)
-
-        if output_attentions:
-            return hidden_states, attn_weights
-        else:
-            return hidden_states, None
-
-
 class WavNodeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
     def __init__(
@@ -931,10 +750,27 @@ class WavNodeEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.aug_dim = getattr(config, 'aug_dim', 0)
+        self.original_hidden_size = config.hidden_size
+
         self.pos_conv_embed = HubertPositionalConvEmbedding(config)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout)
-        self.layer = WavNodeEncoderLayer(config)
+
+        # Augmented Neural ODE: ODE function operates in (hidden_size + aug_dim) space
+        if self.aug_dim > 0:
+            ode_config = copy.deepcopy(config)
+            ode_config.hidden_size = config.hidden_size + config.aug_dim
+            if ode_config.hidden_size % config.num_attention_heads != 0:
+                raise ValueError(
+                    f"Augmented hidden_size ({ode_config.hidden_size} = {config.hidden_size} + {config.aug_dim}) "
+                    f"must be divisible by num_attention_heads ({config.num_attention_heads}). "
+                    f"Choose aug_dim as a multiple of {config.num_attention_heads}."
+                )
+        else:
+            ode_config = config
+
+        self.layer = WavNodeEncoderLayer(ode_config)
         self.solver = Solver(f=self.layer, step_method=config.step_method, use_checkpoint=config.use_checkpoint,)
                              
     def forward(
@@ -967,12 +803,24 @@ class WavNodeEncoder(nn.Module):
 
         hidden_states = hidden_states.detach()
 
+        # Augmented Neural ODE: pad hidden states with zeros in extra dimensions
+        if self.aug_dim > 0:
+            aug_zeros = torch.zeros(
+                *hidden_states.shape[:-1], self.aug_dim,
+                device=hidden_states.device, dtype=hidden_states.dtype,
+            )
+            hidden_states = torch.cat([hidden_states, aug_zeros], dim=-1)
+
         # Solver returns (trajectory, aux_outputs_list)
         # aux_outputs_list is a list of tuples, e.g., [(attn_w_step1,), (attn_w_step2,), ...]
         stacked_hidden_states, aux_outputs = self.solver(times, hidden_states,
                                                           return_trajectory=output_hidden_states,
                                                           attention_mask=attention_mask,
                                                           output_attentions=output_attentions,)
+
+        # Augmented Neural ODE: strip augmented dimensions, keep original hidden_size
+        if self.aug_dim > 0:
+            stacked_hidden_states = stacked_hidden_states[..., :self.original_hidden_size]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + tuple(torch.unbind(stacked_hidden_states, dim=0))
@@ -1138,9 +986,9 @@ class WavNodeModel(WavNodePreTrainedModel):
         self.feature_projection.eval()
 
     def freeze_hubert_layer(self):
-        self.encoder._freeze_hubert_layer()
         self.encoder.layer_norm.eval()
         self.encoder.dropout.eval()
+        self.encoder._freeze_hubert_layer()
         self.encoder.hubert_layer.eval()
 
     def _mask_hidden_states(
@@ -1349,8 +1197,6 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
         """
         self.wavnode.feature_projection._freeze_parameters()
         self.wavnode.feature_projection.eval()
-
-    def freeze_hubert_layer(self):
         self.wavnode.encoder.layer_norm.eval()
         self.wavnode.encoder.dropout.eval()
 
@@ -1447,7 +1293,7 @@ class WavNodeForPreTraining(WavNodePreTrainedModel):
             distil_cos=distil_loss_cos,
         )
 
-class WavNodeForSUPERB(WavNodeModel):
+class WavNodeForSUPERB(WavNodePreTrainedModel):
     def __init__(self, config: WavNodeConfig, time_steps: int=11):
         super().__init__(config)
         self.wavnode = WavNodeModel(config).eval()

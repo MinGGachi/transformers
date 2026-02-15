@@ -183,6 +183,7 @@ class WavNodeConfig(PretrainedConfig):
         time_activation="silu",
         step_method="euler",
         use_checkpoint=True,
+        aug_dim=12,
         apply_spec_augment=True,
         mask_time_prob=0.80,
         mask_time_length=10,
@@ -265,6 +266,7 @@ class WavNodeConfig(PretrainedConfig):
         self.time_activation = time_activation
         self.step_method = step_method
         self.use_checkpoint = use_checkpoint
+        self.aug_dim = aug_dim
 
         if (
             (len(self.conv_stride) != self.num_feat_extract_layers)
